@@ -1,0 +1,24 @@
+# dependencies (never commit these — they're huge and re-installable)
+node_modules/
+frontend/node_modules/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# build output
+dist/
+frontend/dist/
+
+# large raw datasets (the app only needs features.csv, which is small)
+endomondoHR*.json
+*.npy
+*.gz
+preprocess_data.csv
+raw-data-kaggle.csv
+
+# os
+.DS_Store
+Thumbs.db

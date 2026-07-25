@@ -77,11 +77,23 @@ def init_db():
     # lightweight migration: add the input-data columns if they don't exist yet
     for col, coltype in [("typical_pace", "REAL"), ("avg_weekly_km", "REAL"),
                          ("active_weeks", "INTEGER"), ("longest_km", "REAL"),
-                         ("easy_hr", "REAL"), ("max_hr", "REAL")]:
+                         ("easy_hr", "REAL"), ("max_hr", "REAL"),
+                         ("weekly_km_json", "TEXT")]:
         try:
             con.execute(f"ALTER TABLE predictions ADD COLUMN {col} {coltype}")
         except sqlite3.OperationalError:
             pass  # column already exists
+    # per-run data from a user's latest Strava upload (powers the Progress chart)
+    con.execute("""CREATE TABLE IF NOT EXISTS runs (
+        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id  INTEGER NOT NULL,
+        date     TEXT,
+        year     INTEGER,
+        week     INTEGER,
+        dist_km  REAL,
+        pace     REAL,
+        hr       REAL
+    )""")
     con.commit()
     con.close()
 
@@ -181,6 +193,7 @@ def core_predict(gender, typical_pace, easy_hr, max_hr, longest_km, weekly_km):
             "longest_km": round(longest_km, 1),
             "easy_hr": round(easy_hr, 0),
             "max_hr": round(max_hr, 0),
+            "weekly_km": [round(w, 1) for w in weeks],  # the individual weeks, to reload later
         },
     }
 
@@ -190,11 +203,11 @@ def save_prediction(source, gender, predicted_seconds, user_id, inp):
     cur = con.execute(
         """INSERT INTO predictions
            (created_at, user_id, source, gender, predicted_seconds, actual_pr_seconds,
-            typical_pace, avg_weekly_km, active_weeks, longest_km, easy_hr, max_hr)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            typical_pace, avg_weekly_km, active_weeks, longest_km, easy_hr, max_hr, weekly_km_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (datetime.now(timezone.utc).isoformat(), user_id, source, gender, predicted_seconds, None,
          inp["typical_pace"], inp["avg_weekly_km"], inp["active_weeks"],
-         inp["longest_km"], inp["easy_hr"], inp["max_hr"]),
+         inp["longest_km"], inp["easy_hr"], inp["max_hr"], json.dumps(inp["weekly_km"])),
     )
     con.commit()
     rid = cur.lastrowid
@@ -207,6 +220,26 @@ def finalize(result, source, gender, user_id):
         result["id"] = save_prediction(source, gender, result["predicted_seconds"],
                                        user_id, result.pop("_inputs"))
     return result
+
+
+def save_user_runs(user_id, recent):
+    """Replace this user's stored runs with the latest Strava upload (for /progress)."""
+    con = db()
+    con.execute("DELETE FROM runs WHERE user_id=?", (user_id,))
+    recs = []
+    for _, row in recent.iterrows():
+        hr = row.get("hr")
+        recs.append((
+            user_id, row["date"].date().isoformat(), int(row["yr"]), int(row["wk"]),
+            round(float(row["dist_km"]), 2), round(float(row["pace"]), 2),
+            None if pd.isna(hr) else round(float(hr), 0),
+        ))
+    con.executemany(
+        "INSERT INTO runs (user_id, date, year, week, dist_km, pace, hr) VALUES (?,?,?,?,?,?,?)",
+        recs,
+    )
+    con.commit()
+    con.close()
 
 
 # ---------------- models ----------------
@@ -356,11 +389,14 @@ async def predict_from_file(gender: str = Form(...), file: UploadFile = File(...
         return {"error": "Not enough recent runs (last 16 weeks) to make a prediction."}
 
     iso = recent["date"].dt.isocalendar()
-    recent["yw"] = iso.year.astype(str) + "-" + iso.week.astype(str)
+    recent["yr"] = iso.year.values
+    recent["wk"] = iso.week.values
+    recent["yw"] = recent["yr"].astype(str) + "-" + recent["wk"].astype(str)
+    recent["hr"] = pd.to_numeric(recent[ahr_col], errors="coerce") if ahr_col else np.nan
     weekly = recent.groupby("yw")["dist_km"].sum().tolist()
 
     typical_pace = float(recent["pace"].median())
-    ahr = pd.to_numeric(recent[ahr_col], errors="coerce") if ahr_col else pd.Series(dtype=float)
+    ahr = recent["hr"]
     easy_hr = float(ahr.median()) if ahr.notna().any() else 145.0
     if mhr_col and pd.to_numeric(recent[mhr_col], errors="coerce").notna().any():
         max_hr = float(pd.to_numeric(recent[mhr_col], errors="coerce").max())
@@ -378,7 +414,10 @@ async def predict_from_file(gender: str = Form(...), file: UploadFile = File(...
             "avg_hr": round(easy_hr, 0),
             "longest_km": round(longest, 1),
         }
-    return finalize(result, "strava", gender, user_id)
+    result = finalize(result, "strava", gender, user_id)
+    if user_id and "error" not in result:
+        save_user_runs(user_id, recent)  # store runs for the Progress page
+    return result
 
 
 # ---------------- per-user data ----------------
@@ -419,6 +458,79 @@ def claim(data: Claim, user_id: int | None = Depends(get_user_id)):
     return {"ok": True}
 
 
+@app.get("/progress")
+def progress(user_id: int | None = Depends(get_user_id)):
+    """
+    Weekly mileage chart. The BARS come from the user's latest prediction's
+    weekly totals, so manually-added weeks show up too. Per-run detail is layered
+    in from the runs table (their latest Strava upload) wherever a week matches.
+    """
+    if user_id is None:
+        return {"error": "Log in to see your progress.", "weeks": []}
+
+    con = db()
+    prow = con.execute(
+        "SELECT weekly_km_json FROM predictions WHERE user_id=? AND weekly_km_json IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1", (user_id,)
+    ).fetchone()
+    rows = con.execute(
+        "SELECT * FROM runs WHERE user_id=? ORDER BY year, week, date", (user_id,)
+    ).fetchall()
+    con.close()
+
+    latest_weeks = []
+    if prow and prow["weekly_km_json"]:
+        try:
+            latest_weeks = json.loads(prow["weekly_km_json"])
+        except Exception:
+            latest_weeks = []
+
+    from collections import OrderedDict
+    groups: "OrderedDict[tuple, list]" = OrderedDict()
+    for r in rows:
+        groups.setdefault((r["year"], r["week"]), []).append(r)
+    run_weeks = list(groups.items())
+
+    n = len(latest_weeks) if latest_weeks else len(run_weeks)
+    if n == 0:
+        return {"weeks": []}
+
+    weeks = []
+    for i in range(n):
+        mileage = (round(float(latest_weeks[i]), 1) if latest_weeks
+                   else round(sum(x["dist_km"] for x in run_weeks[i][1]), 1))
+        # attach run detail if this position's runs total matches the bar
+        if i < len(run_weeks):
+            (yr, wk), runs = run_weeks[i]
+            if abs(sum(x["dist_km"] for x in runs) - mileage) < 0.5:
+                paces = [x["pace"] for x in runs if x["pace"] is not None]
+                hrs = [x["hr"] for x in runs if x["hr"] is not None]
+                weeks.append({
+                    "label": f"W{wk}",
+                    "mileage_km": mileage,
+                    "num_runs": len(runs),
+                    "avg_pace": round(sum(paces) / len(paces), 2) if paces else None,
+                    "avg_hr": round(sum(hrs) / len(hrs)) if hrs else None,
+                    "runs": [{
+                        "date": x["date"],
+                        "dist_km": round(x["dist_km"], 2),
+                        "pace": round(x["pace"], 2) if x["pace"] is not None else None,
+                        "hr": x["hr"],
+                    } for x in runs],
+                })
+                continue
+        # otherwise: a manually-added week (mileage only, no per-run detail)
+        weeks.append({
+            "label": f"Wk {i + 1}",
+            "mileage_km": mileage,
+            "num_runs": 0,
+            "avg_pace": None,
+            "avg_hr": None,
+            "runs": [],
+        })
+    return {"weeks": weeks[-16:]}
+
+
 @app.get("/history")
 def history(user_id: int | None = Depends(get_user_id)):
     if user_id is None:
@@ -431,6 +543,10 @@ def history(user_id: int | None = Depends(get_user_id)):
     out = []
     for r in rows:
         actual = r["actual_pr_seconds"]
+        try:
+            weekly_km = json.loads(r["weekly_km_json"]) if r["weekly_km_json"] else []
+        except Exception:
+            weekly_km = []
         out.append({
             "id": r["id"],
             "date": r["created_at"][:10],
@@ -438,8 +554,14 @@ def history(user_id: int | None = Depends(get_user_id)):
             "predicted_time": fmt(r["predicted_seconds"]),
             "actual_pr_time": fmt(actual) if actual is not None else None,
             "diff_seconds": round(abs(r["predicted_seconds"] - actual)) if actual is not None else None,
+            # full inputs so the frontend can reload this prediction into the form
+            "gender": r["gender"],
             "typical_pace": r["typical_pace"],
             "avg_weekly_km": r["avg_weekly_km"],
             "active_weeks": r["active_weeks"],
+            "longest_km": r["longest_km"],
+            "easy_hr": r["easy_hr"],
+            "max_hr": r["max_hr"],
+            "weekly_km": weekly_km,
         })
     return {"history": out}

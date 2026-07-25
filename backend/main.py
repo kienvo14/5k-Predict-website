@@ -20,6 +20,7 @@ Passwords are salted + hashed with PBKDF2 (stdlib). Tokens are opaque random
 strings stored in a sessions table (a simple, real alternative to JWT).
 """
 import io
+import json
 import sqlite3
 import hashlib
 import secrets
@@ -73,6 +74,14 @@ def init_db():
         predicted_seconds REAL,
         actual_pr_seconds REAL
     )""")
+    # lightweight migration: add the input-data columns if they don't exist yet
+    for col, coltype in [("typical_pace", "REAL"), ("avg_weekly_km", "REAL"),
+                         ("active_weeks", "INTEGER"), ("longest_km", "REAL"),
+                         ("easy_hr", "REAL"), ("max_hr", "REAL")]:
+        try:
+            con.execute(f"ALTER TABLE predictions ADD COLUMN {col} {coltype}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     con.commit()
     con.close()
 
@@ -164,16 +173,28 @@ def core_predict(gender, typical_pace, easy_hr, max_hr, longest_km, weekly_km):
         "range_high": fmt(pred + CV_MAE),
         "note": "Estimated best current 5K, +/- ~1:22 (cross-validated error).",
         "weeks_used": len(weeks_m),
+        # the actual input data — stored to SQLite so each prediction is self-contained
+        "_inputs": {
+            "typical_pace": round(typical_pace, 2),
+            "avg_weekly_km": round(float(weeks_m.mean()) / 1000.0, 2),
+            "active_weeks": len(weeks_m),
+            "longest_km": round(longest_km, 1),
+            "easy_hr": round(easy_hr, 0),
+            "max_hr": round(max_hr, 0),
+        },
     }
 
 
-def save_prediction(source, gender, predicted_seconds, user_id):
+def save_prediction(source, gender, predicted_seconds, user_id, inp):
     con = db()
     cur = con.execute(
         """INSERT INTO predictions
-           (created_at, user_id, source, gender, predicted_seconds, actual_pr_seconds)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (datetime.now(timezone.utc).isoformat(), user_id, source, gender, predicted_seconds, None),
+           (created_at, user_id, source, gender, predicted_seconds, actual_pr_seconds,
+            typical_pace, avg_weekly_km, active_weeks, longest_km, easy_hr, max_hr)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (datetime.now(timezone.utc).isoformat(), user_id, source, gender, predicted_seconds, None,
+         inp["typical_pace"], inp["avg_weekly_km"], inp["active_weeks"],
+         inp["longest_km"], inp["easy_hr"], inp["max_hr"]),
     )
     con.commit()
     rid = cur.lastrowid
@@ -183,7 +204,8 @@ def save_prediction(source, gender, predicted_seconds, user_id):
 
 def finalize(result, source, gender, user_id):
     if "error" not in result:
-        result["id"] = save_prediction(source, gender, result["predicted_seconds"], user_id)
+        result["id"] = save_prediction(source, gender, result["predicted_seconds"],
+                                       user_id, result.pop("_inputs"))
     return result
 
 
@@ -292,9 +314,13 @@ async def predict_from_file(gender: str = Form(...), file: UploadFile = File(...
                             user_id: int | None = Depends(get_user_id)):
     try:
         raw = await file.read()
-        df = pd.read_csv(io.BytesIO(raw))
+        name = (file.filename or "").lower()
+        if name.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(io.BytesIO(raw))          # Excel export
+        else:
+            df = pd.read_csv(io.BytesIO(raw))            # CSV export
     except Exception:
-        return {"error": "Could not read the file. Make sure it's a .csv."}
+        return {"error": "Could not read the file. Upload your Strava activities .csv or .xlsx."}
 
     type_col = find_col(df, "Activity Type")
     date_col = find_col(df, "Activity Date", "Date")
@@ -412,5 +438,8 @@ def history(user_id: int | None = Depends(get_user_id)):
             "predicted_time": fmt(r["predicted_seconds"]),
             "actual_pr_time": fmt(actual) if actual is not None else None,
             "diff_seconds": round(abs(r["predicted_seconds"] - actual)) if actual is not None else None,
+            "typical_pace": r["typical_pace"],
+            "avg_weekly_km": r["avg_weekly_km"],
+            "active_weeks": r["active_weeks"],
         })
     return {"history": out}

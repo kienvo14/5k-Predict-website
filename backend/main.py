@@ -35,8 +35,14 @@ import numpy as np
 
 FEATURE_COLS = ["longest_run", "max_hr", "easy_pace", "easy_hr", "aerobic",
                 "avg_weekly_distance_m", "active_weeks", "consistency_std", "gender"]
+# full column order of features.csv (features + label), used when appending new rows
+CSV_COLS = ["userId", "longest_run", "gender", "max_hr", "easy_pace", "easy_hr",
+            "aerobic", "avg_weekly_distance_m", "active_weeks", "consistency_std",
+            "fastest_5k", "fastest_5k_str"]
 CV_MAE = 82
 DB_PATH = "app.db"
+FEATURES_PATH = "features.csv"
+MIN_NEW_TO_RETRAIN = 10   # append real-PR rows to features.csv once this many accumulate
 
 app = FastAPI(title="5K Predictor API")
 app.add_middleware(
@@ -78,7 +84,7 @@ def init_db():
     for col, coltype in [("typical_pace", "REAL"), ("avg_weekly_km", "REAL"),
                          ("active_weeks", "INTEGER"), ("longest_km", "REAL"),
                          ("easy_hr", "REAL"), ("max_hr", "REAL"),
-                         ("weekly_km_json", "TEXT")]:
+                         ("weekly_km_json", "TEXT"), ("exported", "INTEGER")]:
         try:
             con.execute(f"ALTER TABLE predictions ADD COLUMN {col} {coltype}")
         except sqlite3.OperationalError:
@@ -135,7 +141,7 @@ def get_user_id(authorization: str | None = Header(default=None)):
 
 # ---------------- model ----------------
 def train_model() -> LinearRegression:
-    df = pd.read_csv("features.csv")
+    df = pd.read_csv(FEATURES_PATH)
     df["gender"] = df["gender"].map({"male": 0, "female": 1})
     X = df[FEATURE_COLS]
     y = df["fastest_5k"]
@@ -421,6 +427,63 @@ async def predict_from_file(gender: str = Form(...), file: UploadFile = File(...
 
 
 # ---------------- per-user data ----------------
+def export_new_training_data(min_new: int = MIN_NEW_TO_RETRAIN):
+    """
+    Data flywheel: predictions that have a REAL PR (from /feedback) are real
+    labeled examples. Once `min_new` of them accumulate, append them to
+    features.csv (mapping units to match) and retrain the model on the spot.
+    """
+    con = db()
+    rows = con.execute(
+        "SELECT * FROM predictions WHERE actual_pr_seconds IS NOT NULL "
+        "AND (exported IS NULL OR exported = 0)"
+    ).fetchall()
+
+    ready = []
+    for r in rows:
+        weekly = []
+        if r["weekly_km_json"]:
+            try:
+                weekly = json.loads(r["weekly_km_json"])
+            except Exception:
+                weekly = []
+        weekly_m = [w * 1000 for w in weekly if w and w > 0]
+        # need complete, sane inputs to form a valid training row
+        if len(weekly_m) >= 2 and r["easy_hr"] and r["typical_pace"] and r["gender"]:
+            ready.append((r, weekly_m))
+
+    if len(ready) < min_new:
+        con.close()
+        return {"added": 0, "pending": len(ready), "needed": min_new}
+
+    new_rows, ids = [], []
+    for r, weekly_m in ready:
+        new_rows.append({
+            "userId": f"user{r['user_id'] or 0}_{r['id']}",
+            "longest_run": round((r["longest_km"] or 0) * 1000, 1),   # km -> m
+            "gender": r["gender"],
+            "max_hr": r["max_hr"],
+            "easy_pace": r["typical_pace"],
+            "easy_hr": r["easy_hr"],
+            "aerobic": round(r["typical_pace"] / r["easy_hr"], 6),
+            "avg_weekly_distance_m": round((r["avg_weekly_km"] or 0) * 1000, 1),
+            "active_weeks": r["active_weeks"],
+            "consistency_std": round(float(np.std(weekly_m, ddof=1)), 1),
+            "fastest_5k": r["actual_pr_seconds"],                     # the REAL label
+            "fastest_5k_str": fmt(r["actual_pr_seconds"]),
+        })
+        ids.append(r["id"])
+
+    pd.DataFrame(new_rows)[CSV_COLS].to_csv(FEATURES_PATH, mode="a", header=False, index=False)
+    con.executemany("UPDATE predictions SET exported = 1 WHERE id = ?", [(i,) for i in ids])
+    con.commit()
+    con.close()
+
+    global model
+    model = train_model()   # retrain on the enlarged dataset
+    return {"added": len(new_rows), "retrained": True}
+
+
 @app.post("/feedback")
 def feedback(fb: Feedback):
     try:
@@ -441,8 +504,12 @@ def feedback(fb: Feedback):
     diff = round(abs(predicted - actual))
     verdict = ("Spot on — within the model's margin." if diff <= CV_MAE
                else "Pretty close." if diff <= 2 * CV_MAE else "Off this time.")
+
+    # data flywheel: this new real-PR row may trigger a retrain
+    training = export_new_training_data()
+
     return {"ok": True, "predicted_time": fmt(predicted), "actual_time": fmt(actual),
-            "diff_seconds": diff, "verdict": verdict}
+            "diff_seconds": diff, "verdict": verdict, "training": training}
 
 
 @app.post("/claim")

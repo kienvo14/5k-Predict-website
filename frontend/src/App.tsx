@@ -1,233 +1,360 @@
-import { useState } from "react";
-
-const API = "http://localhost:8000";
+import { useEffect, useState } from "react";
+import { Routes, Route, NavLink, useNavigate } from "react-router-dom";
+import { api, getToken, setToken } from "./api";
+import Auth from "./Auth";
+import History, { HistoryRow } from "./History";
+import ProgressPage from "./ProgressPage";
+import { paceToStr, paceToDec } from "./format";
 
 type Prediction = {
+  id?: number;
   predicted_time: string;
   range_low: string;
   range_high: string;
   note: string;
-  weeks_used?: number;
-  detected?: {
-    runs_used: number;
-    typical_pace: number;
-    avg_hr: number;
-    longest_km: number;
-  };
+  detected?: { runs_used: number; typical_pace: number; avg_hr: number; longest_km: number };
 };
-
-type Mode = "manual" | "upload";
+type FeedbackResult = { predicted_time: string; actual_time: string; diff_seconds: number; verdict: string };
 
 export default function App() {
-  const [mode, setMode] = useState<Mode>("manual");
+  const navigate = useNavigate();
 
-  // shared result state
-  const [result, setResult] = useState<Prediction | null>(null);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
+  // auth
+  const [user, setUser] = useState<string | null>(null);
+  const [showAuth, setShowAuth] = useState(false);
+  const [pendingClaimId, setPendingClaimId] = useState<number | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
 
-  // manual inputs
+  // predict inputs
+  const [mode, setMode] = useState<"manual" | "upload">("manual");
   const [gender, setGender] = useState("male");
   const [pace, setPace] = useState("");
   const [easyHr, setEasyHr] = useState("");
   const [maxHr, setMaxHr] = useState("");
   const [longest, setLongest] = useState("");
   const [weeks, setWeeks] = useState<string[]>(["", "", ""]);
-
-  // upload inputs
   const [uploadGender, setUploadGender] = useState("male");
   const [file, setFile] = useState<File | null>(null);
+
+  // results
+  const [result, setResult] = useState<Prediction | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [pr, setPr] = useState("");
+  const [feedback, setFeedback] = useState<FeedbackResult | null>(null);
+  const [fbError, setFbError] = useState("");
+
+  // Pre-fill the Predict form with the user's most recent prediction.
+  const prefillLatest = async () => {
+    const d = await api.history();
+    if (d.history && d.history.length) {
+      const row = d.history[0];
+      setMode("manual");
+      setGender(row.gender ?? "male");
+      setPace(row.typical_pace != null ? paceToStr(row.typical_pace) : "");
+      setEasyHr(row.easy_hr != null ? String(row.easy_hr) : "");
+      setMaxHr(row.max_hr != null ? String(row.max_hr) : "");
+      setLongest(row.longest_km != null ? String(row.longest_km) : "");
+      if (row.weekly_km && row.weekly_km.length) setWeeks(row.weekly_km.map(String));
+    }
+  };
+
+  useEffect(() => {
+    if (getToken())
+      api.me().then((d) => {
+        if (d.user) {
+          setUser(d.user);
+          prefillLatest(); // start from their most recent prediction
+        }
+      });
+  }, []);
+
+  const logout = async () => {
+    await api.logout();
+    setToken(null);
+    setUser(null);
+    navigate("/");
+  };
+
+  const onAuthed = async (username: string) => {
+    setUser(username);
+    setShowAuth(false);
+    if (pendingClaimId) {
+      await api.claim(pendingClaimId);
+      setPendingClaimId(null);
+    } else {
+      prefillLatest(); // no pending claim -> start from their most recent prediction
+    }
+    setRefreshKey((k) => k + 1);
+  };
 
   const setWeek = (i: number, v: string) => {
     const next = [...weeks];
     next[i] = v;
     setWeeks(next);
   };
-  const addWeek = () => weeks.length < 16 && setWeeks([...weeks, ""]);
-  const removeWeek = (i: number) => setWeeks(weeks.filter((_, j) => j !== i));
 
-  const reset = () => {
+  const resetResult = () => {
     setError("");
     setResult(null);
     setLoading(true);
+    setFeedback(null);
+    setFbError("");
+    setPr("");
   };
 
   const submitManual = async () => {
-    reset();
-    try {
-      const res = await fetch(`${API}/predict`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          gender,
-          typical_pace: parseFloat(pace),
-          easy_hr: parseFloat(easyHr),
-          max_hr: parseFloat(maxHr),
-          longest_run_km: parseFloat(longest),
-          weekly_mileage_km: weeks
-            .map((w) => parseFloat(w))
-            .filter((w) => !isNaN(w) && w > 0),
-        }),
-      });
-      const data = await res.json();
-      data.error ? setError(data.error) : setResult(data);
-    } catch {
-      setError("Could not reach the backend. Is it running on :8000?");
-    }
+    resetResult();
+    const data = await api.predict({
+      gender,
+      typical_pace: paceToDec(pace),
+      easy_hr: parseFloat(easyHr),
+      max_hr: parseFloat(maxHr),
+      longest_run_km: parseFloat(longest),
+      weekly_mileage_km: weeks.map((w) => parseFloat(w)).filter((w) => !isNaN(w) && w > 0),
+    });
     setLoading(false);
+    data.error ? setError(data.error) : (setResult(data), setRefreshKey((k) => k + 1));
   };
 
   const submitUpload = async () => {
-    if (!file) {
-      setError("Please choose your Strava activities.csv file.");
-      return;
-    }
-    reset();
-    try {
-      const form = new FormData();
-      form.append("gender", uploadGender);
-      form.append("file", file);
-      const res = await fetch(`${API}/predict-from-file`, {
-        method: "POST",
-        body: form,
-      });
-      const data = await res.json();
-      data.error ? setError(data.error) : setResult(data);
-    } catch {
-      setError("Could not reach the backend. Is it running on :8000?");
-    }
+    if (!file) return setError("Please choose your Strava activities file.");
+    resetResult();
+    const form = new FormData();
+    form.append("gender", uploadGender);
+    form.append("file", file);
+    const data = await api.predictFile(form);
     setLoading(false);
+    data.error ? setError(data.error) : (setResult(data), setRefreshKey((k) => k + 1));
   };
+
+  const submitFeedback = async () => {
+    if (!result?.id) return;
+    setFbError("");
+    const data = await api.feedback(result.id, pr);
+    data.error ? setFbError(data.error) : (setFeedback(data), setRefreshKey((k) => k + 1));
+  };
+
+  const askLoginToSave = () => {
+    if (result?.id) setPendingClaimId(result.id);
+    setShowAuth(true);
+  };
+
+  // Click a history item -> reload its inputs into the form, add a blank week, go to Predict.
+  const loadPrediction = (row: HistoryRow) => {
+    setMode("manual");
+    setGender(row.gender ?? "male");
+    setPace(row.typical_pace != null ? paceToStr(row.typical_pace) : "");
+    setEasyHr(row.easy_hr != null ? String(row.easy_hr) : "");
+    setMaxHr(row.max_hr != null ? String(row.max_hr) : "");
+    setLongest(row.longest_km != null ? String(row.longest_km) : "");
+    setWeeks([...(row.weekly_km ?? []).map(String), ""]);
+    setResult(null);
+    setError("");
+    setFeedback(null);
+    navigate("/");
+  };
+
+  const navClass = ({ isActive }: { isActive: boolean }) => (isActive ? "nav-tab active" : "nav-tab");
+
+  const predictView = (
+    <div className="card">
+      <div className="tabs">
+        <button className={mode === "manual" ? "tab active" : "tab"} onClick={() => setMode("manual")}>
+          Enter manually
+        </button>
+        <button className={mode === "upload" ? "tab active" : "tab"} onClick={() => setMode("upload")}>
+          Upload Strava export
+        </button>
+      </div>
+
+      {mode === "manual" ? (
+        <div className="form">
+          <div className="cols">
+            <div className="col">
+              <div className="grid">
+                <div className="field">
+                  <label>Gender</label>
+                  <select value={gender} onChange={(e) => setGender(e.target.value)}>
+                    <option value="male">Male</option>
+                    <option value="female">Female</option>
+                  </select>
+                </div>
+                <div className="field">
+                  <label>Typical pace (mm:ss / km)</label>
+                  <input value={pace} onChange={(e) => setPace(e.target.value)} placeholder="5:30" />
+                </div>
+                <div className="field">
+                  <label>Easy-run avg HR</label>
+                  <input value={easyHr} onChange={(e) => setEasyHr(e.target.value)} placeholder="145" />
+                </div>
+                <div className="field">
+                  <label>Max HR seen</label>
+                  <input value={maxHr} onChange={(e) => setMaxHr(e.target.value)} placeholder="185" />
+                </div>
+                <div className="field wide">
+                  <label>Longest recent run (km)</label>
+                  <input value={longest} onChange={(e) => setLongest(e.target.value)} placeholder="15" />
+                </div>
+              </div>
+            </div>
+
+            <div className="col">
+              <label className="section-label">Weekly mileage (km per week)</label>
+              <div className="weeks">
+                {weeks.map((w, i) => (
+                  <div className="week-row" key={i}>
+                    <span className="week-num">Week {i + 1}</span>
+                    <input value={w} onChange={(e) => setWeek(i, e.target.value)} placeholder="40" />
+                    {weeks.length > 1 && (
+                      <button className="rm" onClick={() => setWeeks(weeks.filter((_, j) => j !== i))} type="button">×</button>
+                    )}
+                  </div>
+                ))}
+              </div>
+              {weeks.length < 16 && (
+                <button className="add" onClick={() => setWeeks([...weeks, ""])} type="button">+ Add week</button>
+              )}
+            </div>
+          </div>
+
+          <button className="predict" onClick={submitManual} disabled={loading}>
+            {loading ? "Predicting…" : "Predict my 5K"}
+          </button>
+        </div>
+      ) : (
+        <div className="form">
+          <p className="upload-help">
+            Export from Strava → Settings → “Download or Delete Your Account” → Request Archive.
+            Upload the <code>activities.csv</code> — we use your <strong>most recent 16 weeks</strong> of runs.
+          </p>
+          <div className="field">
+            <label>Gender</label>
+            <select value={uploadGender} onChange={(e) => setUploadGender(e.target.value)}>
+              <option value="male">Male</option>
+              <option value="female">Female</option>
+            </select>
+          </div>
+          <label className="section-label">Strava activities file (.csv or .xlsx)</label>
+          <label className="file-drop">
+            <input type="file" accept=".csv,.xlsx,.xls" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+            <span>{file ? `📄 ${file.name}` : "Click to choose your activities file"}</span>
+          </label>
+          <button className="predict" onClick={submitUpload} disabled={loading}>
+            {loading ? "Analyzing…" : "Predict from my Strava data"}
+          </button>
+        </div>
+      )}
+
+      {error && <div className="error">{error}</div>}
+
+      {result && (
+        <div className="result">
+          <div className="result-label">Estimated 5K</div>
+          <div className="big">{result.predicted_time}</div>
+          <div className="range">likely {result.range_low} – {result.range_high}</div>
+          {result.detected && (
+            <div className="detected">
+              From {result.detected.runs_used} runs · typical pace {paceToStr(result.detected.typical_pace)}/km ·
+              avg HR {result.detected.avg_hr} · longest {result.detected.longest_km} km
+            </div>
+          )}
+          <div className="note">{result.note}</div>
+
+          {!feedback ? (
+            <div className="feedback">
+              <label>Know your real 5K PR? See how close we got:</label>
+              <div className="fb-row">
+                <input value={pr} onChange={(e) => setPr(e.target.value)} placeholder="22:30" />
+                <button onClick={submitFeedback} type="button">Check</button>
+              </div>
+              {fbError && <div className="fb-error">{fbError}</div>}
+            </div>
+          ) : (
+            <div className="feedback done">
+              <div className="fb-verdict">{feedback.verdict}</div>
+              <div className="fb-detail">
+                Predicted {feedback.predicted_time} · your PR {feedback.actual_time} · off by {feedback.diff_seconds}s
+              </div>
+            </div>
+          )}
+
+          <div className="save-row">
+            {user ? (
+              <span className="saved">✓ Saved to your history</span>
+            ) : (
+              <button className="save-btn" onClick={askLoginToSave}>Log in to save this to your history</button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div className="page">
-      <header className="hero">
-        <div className="badge">🏃 5K PREDICTOR</div>
-        <h1>How fast is your 5K right now?</h1>
-        <p>
-          A regression model trained on <strong>117,000+ runs</strong> estimates
-          your current 5K from your training — pace, mileage, and heart rate.
-        </p>
-      </header>
-
-      <div className="card">
-        <div className="tabs">
-          <button
-            className={mode === "manual" ? "tab active" : "tab"}
-            onClick={() => setMode("manual")}
-          >
-            Enter manually
-          </button>
-          <button
-            className={mode === "upload" ? "tab active" : "tab"}
-            onClick={() => setMode("upload")}
-          >
-            Upload Strava export
-          </button>
+      <div className="topbar">
+        <div className="brand">🏃 5K Predictor</div>
+        <div className="auth-actions">
+          {user ? (
+            <>
+              <span className="who">{user}</span>
+              <button className="ghost" onClick={logout}>Log out</button>
+            </>
+          ) : (
+            <button className="ghost" onClick={() => setShowAuth(true)}>Log in / Sign up</button>
+          )}
         </div>
-
-        {mode === "manual" ? (
-          <div className="form">
-            <div className="grid">
-              <div className="field">
-                <label>Gender</label>
-                <select value={gender} onChange={(e) => setGender(e.target.value)}>
-                  <option value="male">Male</option>
-                  <option value="female">Female</option>
-                </select>
-              </div>
-              <div className="field">
-                <label>Typical pace (min/km)</label>
-                <input value={pace} onChange={(e) => setPace(e.target.value)} placeholder="5.5 = 5:30" />
-              </div>
-              <div className="field">
-                <label>Easy-run avg HR</label>
-                <input value={easyHr} onChange={(e) => setEasyHr(e.target.value)} placeholder="145" />
-              </div>
-              <div className="field">
-                <label>Max HR seen</label>
-                <input value={maxHr} onChange={(e) => setMaxHr(e.target.value)} placeholder="185" />
-              </div>
-              <div className="field wide">
-                <label>Longest recent run (km)</label>
-                <input value={longest} onChange={(e) => setLongest(e.target.value)} placeholder="15" />
-              </div>
-            </div>
-
-            <label className="section-label">Weekly mileage (km per week)</label>
-            <div className="weeks">
-              {weeks.map((w, i) => (
-                <div className="week-row" key={i}>
-                  <span className="week-num">Wk {i + 1}</span>
-                  <input value={w} onChange={(e) => setWeek(i, e.target.value)} placeholder="40" />
-                  {weeks.length > 1 && (
-                    <button className="rm" onClick={() => removeWeek(i)} type="button">×</button>
-                  )}
-                </div>
-              ))}
-            </div>
-            {weeks.length < 16 && (
-              <button className="add" onClick={addWeek} type="button">+ Add week</button>
-            )}
-
-            <button className="predict" onClick={submitManual} disabled={loading}>
-              {loading ? "Predicting…" : "Predict my 5K"}
-            </button>
-          </div>
-        ) : (
-          <div className="form">
-            <p className="upload-help">
-              Export your data from Strava → Settings → “Download or Delete Your Account” →
-              Request Archive. Upload the <code>activities.csv</code> — we’ll use your{" "}
-              <strong>most recent 16 weeks</strong> of runs.
-            </p>
-            <div className="field">
-              <label>Gender</label>
-              <select value={uploadGender} onChange={(e) => setUploadGender(e.target.value)}>
-                <option value="male">Male</option>
-                <option value="female">Female</option>
-              </select>
-            </div>
-            <label className="section-label">Strava activities.csv</label>
-            <label className="file-drop">
-              <input
-                type="file"
-                accept=".csv"
-                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-              />
-              <span>{file ? `📄 ${file.name}` : "Click to choose your activities.csv"}</span>
-            </label>
-
-            <button className="predict" onClick={submitUpload} disabled={loading}>
-              {loading ? "Analyzing…" : "Predict from my Strava data"}
-            </button>
-          </div>
-        )}
-
-        {error && <div className="error">{error}</div>}
-
-        {result && (
-          <div className="result">
-            <div className="result-label">Estimated 5K</div>
-            <div className="big">{result.predicted_time}</div>
-            <div className="range">
-              likely {result.range_low} – {result.range_high}
-            </div>
-            {result.detected && (
-              <div className="detected">
-                From {result.detected.runs_used} runs · typical pace{" "}
-                {result.detected.typical_pace} min/km · avg HR {result.detected.avg_hr} ·
-                longest {result.detected.longest_km} km
-              </div>
-            )}
-            <div className="note">{result.note}</div>
-          </div>
-        )}
       </div>
 
-      <footer className="foot">
-        React + TypeScript · FastAPI · scikit-learn — CV MAE ≈ 82s
-      </footer>
+      <header className="hero">
+        <div className="hero-mark">
+          <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="50" cy="50" r="38" fill="none" stroke="#fc4c02" strokeWidth="2" opacity="0.9" />
+            <circle cx="50" cy="12" r="5.5" fill="#fc4c02" />
+          </svg>
+        </div>
+        <div className="badge">TRAINED ON 117,000+ RUNS</div>
+        <h1>How fast is your 5K right now?</h1>
+        <p>A regression model estimates your current 5K from your training — pace, mileage, and heart rate.</p>
+      </header>
+
+      <div className="nav">
+        <NavLink to="/" end className={navClass}>Predict</NavLink>
+        <NavLink to="/history" className={navClass}>History</NavLink>
+        <NavLink to="/progress" className={navClass}>Progress</NavLink>
+      </div>
+
+      <Routes>
+        <Route path="/" element={predictView} />
+        <Route
+          path="/history"
+          element={
+            <div className="card">
+              <History loggedIn={!!user} refreshKey={refreshKey} onSelect={loadPrediction} />
+            </div>
+          }
+        />
+        <Route
+          path="/progress"
+          element={
+            <div className="card">
+              <ProgressPage loggedIn={!!user} refreshKey={refreshKey} />
+            </div>
+          }
+        />
+      </Routes>
+
+      <div className="stats">
+        <div className="stat"><b>117,000+</b><span>runs</span></div>
+        <div className="stat"><b>734,000</b><span>miles</span></div>
+        <div className="stat"><b>±80s</b><span>accuracy</span></div>
+        <div className="stat"><b>SQLite</b><span>storage</span></div>
+      </div>
+
+      <footer className="foot">React + TypeScript · FastAPI · scikit-learn · SQLite — CV MAE ≈ 82s</footer>
+
+      {showAuth && <Auth onClose={() => setShowAuth(false)} onAuthed={onAuthed} />}
     </div>
   );
 }

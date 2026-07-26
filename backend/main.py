@@ -556,46 +556,103 @@ def progress(user_id: int | None = Depends(get_user_id)):
     groups: "OrderedDict[tuple, list]" = OrderedDict()
     for r in rows:
         groups.setdefault((r["year"], r["week"]), []).append(r)
-    run_weeks = list(groups.items())
+    # real Strava weeks (year < 9000), chronological; manual weeks use key (9000, idx)
+    strava_keys = [k for k in groups.keys() if k[0] < 9000]
 
-    n = len(latest_weeks) if latest_weeks else len(run_weeks)
+    n = len(latest_weeks) if latest_weeks else len(strava_keys)
     if n == 0:
         return {"weeks": []}
+
+    def detail(key, runs, mileage, i):
+        paces = [x["pace"] for x in runs if x["pace"] is not None]
+        hrs = [x["hr"] for x in runs if x["hr"] is not None]
+        return {
+            "idx": i, "year": key[0], "week": key[1],
+            "label": f"W{key[1]}" if key[0] < 9000 else f"Wk {i + 1}",
+            "mileage_km": mileage, "num_runs": len(runs),
+            "avg_pace": round(sum(paces) / len(paces), 2) if paces else None,
+            "avg_hr": round(sum(hrs) / len(hrs)) if hrs else None,
+            "runs": [{
+                "date": x["date"],
+                "dist_km": round(x["dist_km"], 2),
+                "pace": round(x["pace"], 2) if x["pace"] is not None else None,
+                "hr": x["hr"],
+            } for x in runs],
+        }
 
     weeks = []
     for i in range(n):
         mileage = (round(float(latest_weeks[i]), 1) if latest_weeks
-                   else round(sum(x["dist_km"] for x in run_weeks[i][1]), 1))
-        # attach run detail if this position's runs total matches the bar
-        if i < len(run_weeks):
-            (yr, wk), runs = run_weeks[i]
+                   else round(sum(x["dist_km"] for x in groups[strava_keys[i]]), 1))
+        attached = False
+        if i < len(strava_keys):  # a Strava week (matches by position + mileage)
+            key = strava_keys[i]
+            runs = groups[key]
             if abs(sum(x["dist_km"] for x in runs) - mileage) < 0.5:
-                paces = [x["pace"] for x in runs if x["pace"] is not None]
-                hrs = [x["hr"] for x in runs if x["hr"] is not None]
+                weeks.append(detail(key, runs, mileage, i))
+                attached = True
+        if not attached:  # manual week: runs (if any) live under sentinel key (9000, i)
+            sruns = groups.get((9000, i), [])
+            if sruns:
+                weeks.append(detail((9000, i), sruns, mileage, i))
+            else:
                 weeks.append({
-                    "label": f"W{wk}",
-                    "mileage_km": mileage,
-                    "num_runs": len(runs),
-                    "avg_pace": round(sum(paces) / len(paces), 2) if paces else None,
-                    "avg_hr": round(sum(hrs) / len(hrs)) if hrs else None,
-                    "runs": [{
-                        "date": x["date"],
-                        "dist_km": round(x["dist_km"], 2),
-                        "pace": round(x["pace"], 2) if x["pace"] is not None else None,
-                        "hr": x["hr"],
-                    } for x in runs],
+                    "idx": i, "year": 9000, "week": i, "label": f"Wk {i + 1}",
+                    "mileage_km": mileage, "num_runs": 0,
+                    "avg_pace": None, "avg_hr": None, "runs": [],
                 })
-                continue
-        # otherwise: a manually-added week (mileage only, no per-run detail)
-        weeks.append({
-            "label": f"Wk {i + 1}",
-            "mileage_km": mileage,
-            "num_runs": 0,
-            "avg_pace": None,
-            "avg_hr": None,
-            "runs": [],
-        })
     return {"weeks": weeks[-16:]}
+
+
+class AddRun(BaseModel):
+    week_idx: int
+    dist_km: float
+    pace: str                       # "mm:ss" or decimal minutes
+    date: str | None = None         # YYYY-MM-DD (defaults to today)
+    hr: float | None = None         # optional avg HR for the run
+
+
+@app.post("/add-run")
+def add_run(data: AddRun, user_id: int | None = Depends(get_user_id)):
+    """Add a run to a manually-entered week so it gets an avg pace + detail."""
+    if user_id is None:
+        return {"error": "Log in first."}
+    if data.dist_km <= 0:
+        return {"error": "Distance must be greater than 0."}
+    try:
+        pace_dec = parse_time(data.pace) / 60.0  # "5:30" -> 5.5 min/km
+    except Exception:
+        return {"error": "Enter pace as mm:ss, e.g. 5:30"}
+
+    run_date = (data.date or "").strip() or datetime.now(timezone.utc).date().isoformat()
+    hr = None
+    if data.hr is not None:
+        if data.hr < 60 or data.hr > 230:
+            return {"error": "HR looks off (expected 60–230 bpm)."}
+        hr = round(float(data.hr))
+
+    con = db()
+    con.execute(
+        "INSERT INTO runs (user_id, date, year, week, dist_km, pace, hr) VALUES (?,?,?,?,?,?,?)",
+        (user_id, run_date, 9000, data.week_idx, round(data.dist_km, 2), round(pace_dec, 3), hr),
+    )
+    total = con.execute(
+        "SELECT SUM(dist_km) FROM runs WHERE user_id=? AND year=9000 AND week=?",
+        (user_id, data.week_idx),
+    ).fetchone()[0]
+    # keep the chart bar in sync with the sum of the week's runs
+    prow = con.execute(
+        "SELECT id, weekly_km_json FROM predictions WHERE user_id=? AND weekly_km_json IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1", (user_id,)
+    ).fetchone()
+    if prow and prow["weekly_km_json"]:
+        wk = json.loads(prow["weekly_km_json"])
+        if 0 <= data.week_idx < len(wk):
+            wk[data.week_idx] = round(total, 1)
+            con.execute("UPDATE predictions SET weekly_km_json=? WHERE id=?", (json.dumps(wk), prow["id"]))
+    con.commit()
+    con.close()
+    return {"ok": True, "week_total_km": round(total, 1)}
 
 
 @app.get("/history")

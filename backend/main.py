@@ -84,7 +84,8 @@ def init_db():
     for col, coltype in [("typical_pace", "REAL"), ("avg_weekly_km", "REAL"),
                          ("active_weeks", "INTEGER"), ("longest_km", "REAL"),
                          ("easy_hr", "REAL"), ("max_hr", "REAL"),
-                         ("weekly_km_json", "TEXT"), ("exported", "INTEGER")]:
+                         ("weekly_km_json", "TEXT"), ("exported", "INTEGER"),
+                         ("weeks_meta_json", "TEXT")]:
         try:
             con.execute(f"ALTER TABLE predictions ADD COLUMN {col} {coltype}")
         except sqlite3.OperationalError:
@@ -204,16 +205,25 @@ def core_predict(gender, typical_pace, easy_hr, max_hr, longest_km, weekly_km):
     }
 
 
-def save_prediction(source, gender, predicted_seconds, user_id, inp):
+def save_prediction(source, gender, predicted_seconds, user_id, inp, meta=None):
+    """
+    Save a prediction. `meta` is a list of {"year", "week"} per bar — the STABLE
+    identity used to attach runs later. Manual weeks use sentinel year=9000; Strava
+    weeks use the real year/week from the upload.
+    """
+    if meta is None:
+        meta = [{"year": 9000, "week": i} for i in range(len(inp["weekly_km"]))]
     con = db()
     cur = con.execute(
         """INSERT INTO predictions
            (created_at, user_id, source, gender, predicted_seconds, actual_pr_seconds,
-            typical_pace, avg_weekly_km, active_weeks, longest_km, easy_hr, max_hr, weekly_km_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            typical_pace, avg_weekly_km, active_weeks, longest_km, easy_hr, max_hr,
+            weekly_km_json, weeks_meta_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (datetime.now(timezone.utc).isoformat(), user_id, source, gender, predicted_seconds, None,
          inp["typical_pace"], inp["avg_weekly_km"], inp["active_weeks"],
-         inp["longest_km"], inp["easy_hr"], inp["max_hr"], json.dumps(inp["weekly_km"])),
+         inp["longest_km"], inp["easy_hr"], inp["max_hr"],
+         json.dumps(inp["weekly_km"]), json.dumps(meta)),
     )
     con.commit()
     rid = cur.lastrowid
@@ -221,10 +231,10 @@ def save_prediction(source, gender, predicted_seconds, user_id, inp):
     return rid
 
 
-def finalize(result, source, gender, user_id):
+def finalize(result, source, gender, user_id, meta=None):
     if "error" not in result:
         result["id"] = save_prediction(source, gender, result["predicted_seconds"],
-                                       user_id, result.pop("_inputs"))
+                                       user_id, result.pop("_inputs"), meta)
     return result
 
 
@@ -399,7 +409,11 @@ async def predict_from_file(gender: str = Form(...), file: UploadFile = File(...
     recent["wk"] = iso.week.values
     recent["yw"] = recent["yr"].astype(str) + "-" + recent["wk"].astype(str)
     recent["hr"] = pd.to_numeric(recent[ahr_col], errors="coerce") if ahr_col else np.nan
-    weekly = recent.groupby("yw")["dist_km"].sum().tolist()
+    # ordered weekly totals + the corresponding (year, week) meta for stable matching
+    grouped = recent.sort_values("date").groupby("yw", sort=False)
+    weekly = grouped["dist_km"].sum().tolist()
+    yw_order = [k for k, _ in grouped]
+    strava_meta = [{"year": int(k.split("-")[0]), "week": int(k.split("-")[1])} for k in yw_order]
 
     typical_pace = float(recent["pace"].median())
     ahr = recent["hr"]
@@ -420,7 +434,7 @@ async def predict_from_file(gender: str = Form(...), file: UploadFile = File(...
             "avg_hr": round(easy_hr, 0),
             "longest_km": round(longest, 1),
         }
-    result = finalize(result, "strava", gender, user_id)
+    result = finalize(result, "strava", gender, user_id, meta=strava_meta)
     if user_id and "error" not in result:
         save_user_runs(user_id, recent)  # store runs for the Progress page
     return result
@@ -537,42 +551,66 @@ def progress(user_id: int | None = Depends(get_user_id)):
 
     con = db()
     prow = con.execute(
-        "SELECT weekly_km_json FROM predictions WHERE user_id=? AND weekly_km_json IS NOT NULL "
-        "ORDER BY id DESC LIMIT 1", (user_id,)
+        "SELECT id, weekly_km_json, weeks_meta_json FROM predictions "
+        "WHERE user_id=? AND weekly_km_json IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (user_id,),
     ).fetchone()
     rows = con.execute(
         "SELECT * FROM runs WHERE user_id=? ORDER BY year, week, date", (user_id,)
     ).fetchall()
-    con.close()
 
-    latest_weeks = []
-    if prow and prow["weekly_km_json"]:
+    latest_weeks: list[float] = []
+    meta: list[dict] = []
+    pred_id = None
+    if prow:
+        pred_id = prow["id"]
         try:
-            latest_weeks = json.loads(prow["weekly_km_json"])
+            latest_weeks = json.loads(prow["weekly_km_json"] or "[]")
         except Exception:
             latest_weeks = []
+        try:
+            meta = json.loads(prow["weeks_meta_json"] or "[]")
+        except Exception:
+            meta = []
 
+    # Group all stored runs by identity (year, week).
     from collections import OrderedDict
     groups: "OrderedDict[tuple, list]" = OrderedDict()
     for r in rows:
         groups.setdefault((r["year"], r["week"]), []).append(r)
-    # real Strava weeks (year < 9000), chronological; manual weeks use key (9000, idx)
     strava_keys = [k for k in groups.keys() if k[0] < 9000]
 
-    n = len(latest_weeks) if latest_weeks else len(strava_keys)
+    # Backfill meta for old predictions (before this fix). Strava predictions get
+    # matched to Strava week keys; manual predictions get sentinel keys (9000, i).
+    if latest_weeks and not meta:
+        if len(strava_keys) == len(latest_weeks):
+            meta = [{"year": k[0], "week": k[1]} for k in strava_keys]
+        else:
+            meta = [{"year": 9000, "week": i} for i in range(len(latest_weeks))]
+        if pred_id is not None:
+            con.execute("UPDATE predictions SET weeks_meta_json=? WHERE id=?",
+                        (json.dumps(meta), pred_id))
+            con.commit()
+    con.close()
+
+    n = len(latest_weeks)
     if n == 0:
         return {"weeks": []}
 
-    def detail(key, runs, mileage, i):
+    def detail(runs, mileage, i, key, label):
         paces = [x["pace"] for x in runs if x["pace"] is not None]
         hrs = [x["hr"] for x in runs if x["hr"] is not None]
         return {
-            "idx": i, "year": key[0], "week": key[1],
-            "label": f"W{key[1]}" if key[0] < 9000 else f"Wk {i + 1}",
-            "mileage_km": mileage, "num_runs": len(runs),
+            "idx": i,
+            "week_key": f"{key[0]}-{key[1]}",   # STABLE identity for /add-run
+            "year": key[0], "week": key[1],
+            "label": label,
+            "mileage_km": mileage,
+            "num_runs": len(runs),
             "avg_pace": round(sum(paces) / len(paces), 2) if paces else None,
             "avg_hr": round(sum(hrs) / len(hrs)) if hrs else None,
             "runs": [{
+                "id": x["id"],
                 "date": x["date"],
                 "dist_km": round(x["dist_km"], 2),
                 "pace": round(x["pace"], 2) if x["pace"] is not None else None,
@@ -582,47 +620,39 @@ def progress(user_id: int | None = Depends(get_user_id)):
 
     weeks = []
     for i in range(n):
-        mileage = (round(float(latest_weeks[i]), 1) if latest_weeks
-                   else round(sum(x["dist_km"] for x in groups[strava_keys[i]]), 1))
-        attached = False
-        if i < len(strava_keys):  # a Strava week (matches by position + mileage)
-            key = strava_keys[i]
-            runs = groups[key]
-            if abs(sum(x["dist_km"] for x in runs) - mileage) < 0.5:
-                weeks.append(detail(key, runs, mileage, i))
-                attached = True
-        if not attached:  # manual week: runs (if any) live under sentinel key (9000, i)
-            sruns = groups.get((9000, i), [])
-            if sruns:
-                weeks.append(detail((9000, i), sruns, mileage, i))
-            else:
-                weeks.append({
-                    "idx": i, "year": 9000, "week": i, "label": f"Wk {i + 1}",
-                    "mileage_km": mileage, "num_runs": 0,
-                    "avg_pace": None, "avg_hr": None, "runs": [],
-                })
+        m = meta[i] if i < len(meta) else {"year": 9000, "week": i}
+        key = (m["year"], m["week"])
+        runs = groups.get(key, [])
+        mileage = round(float(latest_weeks[i]), 1)
+        label = f"W{key[1]}" if key[0] < 9000 else f"Wk {i + 1}"
+        weeks.append(detail(runs, mileage, i, key, label))
     return {"weeks": weeks[-16:]}
 
 
 class AddRun(BaseModel):
-    week_idx: int
+    week_key: str                   # "year-week" from /progress (e.g. "2026-15" or "9000-2")
     dist_km: float
-    pace: str                       # "mm:ss" or decimal minutes
-    date: str | None = None         # YYYY-MM-DD (defaults to today)
-    hr: float | None = None         # optional avg HR for the run
+    pace: str
+    date: str | None = None
+    hr: float | None = None
 
 
 @app.post("/add-run")
 def add_run(data: AddRun, user_id: int | None = Depends(get_user_id)):
-    """Add a run to a manually-entered week so it gets an avg pace + detail."""
+    """Add a run to a specific week (matched by stable key, not position)."""
     if user_id is None:
         return {"error": "Log in first."}
     if data.dist_km <= 0:
         return {"error": "Distance must be greater than 0."}
     try:
-        pace_dec = parse_time(data.pace) / 60.0  # "5:30" -> 5.5 min/km
+        pace_dec = parse_time(data.pace) / 60.0
     except Exception:
         return {"error": "Enter pace as mm:ss, e.g. 5:30"}
+    try:
+        yr_s, wk_s = data.week_key.split("-", 1)
+        year, week = int(yr_s), int(wk_s)
+    except Exception:
+        return {"error": "Invalid week key."}
 
     run_date = (data.date or "").strip() or datetime.now(timezone.utc).date().isoformat()
     hr = None
@@ -634,25 +664,105 @@ def add_run(data: AddRun, user_id: int | None = Depends(get_user_id)):
     con = db()
     con.execute(
         "INSERT INTO runs (user_id, date, year, week, dist_km, pace, hr) VALUES (?,?,?,?,?,?,?)",
-        (user_id, run_date, 9000, data.week_idx, round(data.dist_km, 2), round(pace_dec, 3), hr),
+        (user_id, run_date, year, week, round(data.dist_km, 2), round(pace_dec, 3), hr),
     )
     total = con.execute(
-        "SELECT SUM(dist_km) FROM runs WHERE user_id=? AND year=9000 AND week=?",
-        (user_id, data.week_idx),
+        "SELECT SUM(dist_km) FROM runs WHERE user_id=? AND year=? AND week=?",
+        (user_id, year, week),
     ).fetchone()[0]
-    # keep the chart bar in sync with the sum of the week's runs
+    # keep the chart bar in sync by finding this week's position in the prediction's meta
     prow = con.execute(
-        "SELECT id, weekly_km_json FROM predictions WHERE user_id=? AND weekly_km_json IS NOT NULL "
-        "ORDER BY id DESC LIMIT 1", (user_id,)
+        "SELECT id, weekly_km_json, weeks_meta_json FROM predictions "
+        "WHERE user_id=? AND weekly_km_json IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (user_id,),
     ).fetchone()
-    if prow and prow["weekly_km_json"]:
-        wk = json.loads(prow["weekly_km_json"])
-        if 0 <= data.week_idx < len(wk):
-            wk[data.week_idx] = round(total, 1)
-            con.execute("UPDATE predictions SET weekly_km_json=? WHERE id=?", (json.dumps(wk), prow["id"]))
+    if prow and prow["weekly_km_json"] and prow["weeks_meta_json"]:
+        try:
+            wk_list = json.loads(prow["weekly_km_json"])
+            meta = json.loads(prow["weeks_meta_json"])
+        except Exception:
+            wk_list, meta = [], []
+        for i, m in enumerate(meta):
+            if m.get("year") == year and m.get("week") == week and i < len(wk_list):
+                wk_list[i] = round(float(total), 1)
+                con.execute("UPDATE predictions SET weekly_km_json=? WHERE id=?",
+                            (json.dumps(wk_list), prow["id"]))
+                break
     con.commit()
     con.close()
-    return {"ok": True, "week_total_km": round(total, 1)}
+    return {"ok": True, "week_total_km": round(float(total), 1)}
+
+
+def resync_week_total(con, user_id: int, year: int, week: int):
+    """Keep the prediction's bar in sync with the sum of the runs in that week."""
+    total = con.execute(
+        "SELECT COALESCE(SUM(dist_km), 0) FROM runs WHERE user_id=? AND year=? AND week=?",
+        (user_id, year, week),
+    ).fetchone()[0]
+    prow = con.execute(
+        "SELECT id, weekly_km_json, weeks_meta_json FROM predictions "
+        "WHERE user_id=? AND weekly_km_json IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if not prow:
+        return
+    try:
+        wk_list = json.loads(prow["weekly_km_json"] or "[]")
+        meta = json.loads(prow["weeks_meta_json"] or "[]")
+    except Exception:
+        return
+    for i, m in enumerate(meta):
+        if m.get("year") == year and m.get("week") == week and i < len(wk_list):
+            wk_list[i] = round(float(total), 1)
+            con.execute("UPDATE predictions SET weekly_km_json=? WHERE id=?",
+                        (json.dumps(wk_list), prow["id"]))
+            return
+
+
+class EditRun(BaseModel):
+    hr: float | None = None   # null = clear the HR
+
+
+@app.post("/runs/{run_id}/edit")
+def edit_run(run_id: int, data: EditRun, user_id: int | None = Depends(get_user_id)):
+    """Edit a run's HR (null clears it)."""
+    if user_id is None:
+        return {"error": "Log in first."}
+    hr = None
+    if data.hr is not None:
+        if data.hr < 60 or data.hr > 230:
+            return {"error": "HR looks off (expected 60–230 bpm)."}
+        hr = round(float(data.hr))
+    con = db()
+    row = con.execute(
+        "SELECT user_id FROM runs WHERE id=?", (run_id,)
+    ).fetchone()
+    if not row or row["user_id"] != user_id:
+        con.close()
+        return {"error": "Run not found."}
+    con.execute("UPDATE runs SET hr=? WHERE id=?", (hr, run_id))
+    con.commit()
+    con.close()
+    return {"ok": True, "hr": hr}
+
+
+@app.delete("/runs/{run_id}")
+def delete_run(run_id: int, user_id: int | None = Depends(get_user_id)):
+    """Delete a run; the week's bar syncs to the new sum."""
+    if user_id is None:
+        return {"error": "Log in first."}
+    con = db()
+    row = con.execute(
+        "SELECT user_id, year, week FROM runs WHERE id=?", (run_id,)
+    ).fetchone()
+    if not row or row["user_id"] != user_id:
+        con.close()
+        return {"error": "Run not found."}
+    con.execute("DELETE FROM runs WHERE id=?", (run_id,))
+    resync_week_total(con, user_id, row["year"], row["week"])
+    con.commit()
+    con.close()
+    return {"ok": True}
 
 
 @app.get("/history")

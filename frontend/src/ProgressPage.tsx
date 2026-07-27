@@ -2,9 +2,10 @@ import { useEffect, useState } from "react";
 import { api } from "./api";
 import { paceToStr } from "./format";
 
-type Run = { date: string; dist_km: number; pace: number | null; hr: number | null };
+type Run = { id: number; date: string; dist_km: number; pace: number | null; hr: number | null };
 type Week = {
   idx: number;
+  week_key: string;      // stable "year-week" id used by /add-run
   year: number;
   week: number;
   label: string;
@@ -14,6 +15,48 @@ type Week = {
   avg_hr: number | null;
   runs: Run[];
 };
+
+// One row of the runs table — inline-edit HR and delete.
+function RunRow({ run, onChanged }: { run: Run; onChanged: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [hr, setHr] = useState(run.hr != null ? String(run.hr) : "");
+  const save = async () => {
+    const val = hr.trim() === "" ? null : parseFloat(hr);
+    const d = await api.editRun(run.id, val);
+    if (!d.error) {
+      setEditing(false);
+      onChanged();
+    }
+  };
+  const del = async () => {
+    if (!confirm("Delete this run?")) return;
+    const d = await api.deleteRun(run.id);
+    if (!d.error) onChanged();
+  };
+  return (
+    <div className="wd-run">
+      <span className="wd-date">{run.date}</span>
+      <span>{run.dist_km} km</span>
+      <span>{paceToStr(run.pace)}/km</span>
+      {editing ? (
+        <input
+          className="hr-input"
+          value={hr}
+          onChange={(e) => setHr(e.target.value)}
+          placeholder="bpm"
+          autoFocus
+          onBlur={save}
+          onKeyDown={(e) => e.key === "Enter" && save()}
+        />
+      ) : (
+        <span className="hr-cell" onClick={() => setEditing(true)}>
+          {run.hr ?? "–"} bpm ✏️
+        </span>
+      )}
+      <button className="run-del" onClick={del} type="button" title="Delete run">🗑</button>
+    </div>
+  );
+}
 
 export default function ProgressPage({ loggedIn, refreshKey }: { loggedIn: boolean; refreshKey: number }) {
   const [weeks, setWeeks] = useState<Week[]>([]);
@@ -60,7 +103,7 @@ export default function ProgressPage({ loggedIn, refreshKey }: { loggedIn: boole
     if (!selWeek) return;
     setRErr("");
     const d = await api.addRun(
-      selWeek.idx,
+      selWeek.week_key,
       parseFloat(rDist),
       rPace,
       rDate || undefined,
@@ -130,15 +173,10 @@ export default function ProgressPage({ loggedIn, refreshKey }: { loggedIn: boole
           {selWeek.runs.length > 0 && (
             <div className="wd-runs">
               <div className="wd-run wd-hdr">
-                <span>date</span><span>distance</span><span>pace</span><span>HR</span>
+                <span>date</span><span>distance</span><span>pace</span><span>HR</span><span></span>
               </div>
-              {selWeek.runs.map((r, j) => (
-                <div className="wd-run" key={j}>
-                  <span className="wd-date">{r.date}</span>
-                  <span>{r.dist_km} km</span>
-                  <span>{paceToStr(r.pace)}/km</span>
-                  <span>{r.hr ?? "–"} bpm</span>
-                </div>
+              {selWeek.runs.map((r) => (
+                <RunRow key={r.id} run={r} onChanged={() => load(true)} />
               ))}
             </div>
           )}

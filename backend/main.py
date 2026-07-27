@@ -20,11 +20,19 @@ Passwords are salted + hashed with PBKDF2 (stdlib). Tokens are opaque random
 strings stored in a sessions table (a simple, real alternative to JWT).
 """
 import io
+import os
 import json
 import sqlite3
 import hashlib
 import secrets
 from datetime import datetime, timezone
+
+# Optional: load a local .env for dev (safe if the file/library isn't there).
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
 
 from fastapi import FastAPI, UploadFile, File, Form, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,23 +52,85 @@ DB_PATH = "app.db"
 FEATURES_PATH = "features.csv"
 MIN_NEW_TO_RETRAIN = 10   # append real-PR rows to features.csv once this many accumulate
 
+# DATABASE_URL (env var) picks Postgres for prod. Empty -> SQLite for local dev.
+# NEVER hardcode the URL here — set it in Render dashboard or a local .env (gitignored).
+_DB_URL = os.environ.get("DATABASE_URL", "").strip()
+if _DB_URL.startswith("postgres://"):
+    _DB_URL = "postgresql://" + _DB_URL[len("postgres://"):]  # Render hands "postgres://", psycopg wants "postgresql://"
+IS_PG = bool(_DB_URL)
+PK = "SERIAL PRIMARY KEY" if IS_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
 app = FastAPI(title="5K Predictor API")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
 
-# ---------------- database ----------------
-def db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+# ---------------- database (SQLite locally, Postgres in production) ----------------
+class Db:
+    """Thin wrapper so the same code speaks to both SQLite and Postgres.
+
+    - Translates SQLite-style '?' placeholders into psycopg-style '%s'.
+    - Returns dict-like rows on both (access with row["col"]).
+    - Same .execute / .executemany / .commit / .close surface as sqlite3.Connection.
+    """
+    def __init__(self):
+        if IS_PG:
+            import psycopg  # type: ignore
+            from psycopg.rows import dict_row  # type: ignore
+            self.con = psycopg.connect(_DB_URL, row_factory=dict_row)
+        else:
+            self.con = sqlite3.connect(DB_PATH)
+            self.con.row_factory = sqlite3.Row
+
+    def _sql(self, s: str) -> str:
+        return s.replace("?", "%s") if IS_PG else s
+
+    def execute(self, sql, params=()):
+        if IS_PG:
+            cur = self.con.cursor()
+            cur.execute(self._sql(sql), params)
+            return cur
+        return self.con.execute(sql, params)
+
+    def executemany(self, sql, seq):
+        if IS_PG:
+            cur = self.con.cursor()
+            cur.executemany(self._sql(sql), seq)
+            return cur
+        return self.con.executemany(sql, seq)
+
+    def commit(self):
+        self.con.commit()
+
+    def close(self):
+        try:
+            self.con.close()
+        except Exception:
+            pass
+
+
+def db() -> Db:
+    return Db()
+
+
+def _try_alter(sql: str):
+    """ALTER TABLE ADD COLUMN, ignoring 'already exists'. Each ALTER gets its
+    own connection — on Postgres a failed statement aborts the transaction,
+    so isolating them keeps the rest of migration going."""
+    con = db()
+    try:
+        con.execute(sql)
+        con.commit()
+    except Exception:
+        pass
+    con.close()
 
 
 def init_db():
     con = db()
-    con.execute("""CREATE TABLE IF NOT EXISTS users (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    con.execute(f"""CREATE TABLE IF NOT EXISTS users (
+        id         {PK},
         username   TEXT UNIQUE NOT NULL,
         salt       TEXT NOT NULL,
         pw_hash    TEXT NOT NULL,
@@ -71,8 +141,8 @@ def init_db():
         user_id    INTEGER NOT NULL,
         created_at TEXT NOT NULL
     )""")
-    con.execute("""CREATE TABLE IF NOT EXISTS predictions (
-        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    con.execute(f"""CREATE TABLE IF NOT EXISTS predictions (
+        id                {PK},
         created_at        TEXT NOT NULL,
         user_id           INTEGER,
         source            TEXT,
@@ -80,19 +150,8 @@ def init_db():
         predicted_seconds REAL,
         actual_pr_seconds REAL
     )""")
-    # lightweight migration: add the input-data columns if they don't exist yet
-    for col, coltype in [("typical_pace", "REAL"), ("avg_weekly_km", "REAL"),
-                         ("active_weeks", "INTEGER"), ("longest_km", "REAL"),
-                         ("easy_hr", "REAL"), ("max_hr", "REAL"),
-                         ("weekly_km_json", "TEXT"), ("exported", "INTEGER"),
-                         ("weeks_meta_json", "TEXT")]:
-        try:
-            con.execute(f"ALTER TABLE predictions ADD COLUMN {col} {coltype}")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-    # per-run data from a user's latest Strava upload (powers the Progress chart)
-    con.execute("""CREATE TABLE IF NOT EXISTS runs (
-        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    con.execute(f"""CREATE TABLE IF NOT EXISTS runs (
+        id       {PK},
         user_id  INTEGER NOT NULL,
         date     TEXT,
         year     INTEGER,
@@ -103,6 +162,13 @@ def init_db():
     )""")
     con.commit()
     con.close()
+    # additive columns (safe to re-run; each uses its own conn so pg tx doesn't abort)
+    for col, coltype in [("typical_pace", "REAL"), ("avg_weekly_km", "REAL"),
+                         ("active_weeks", "INTEGER"), ("longest_km", "REAL"),
+                         ("easy_hr", "REAL"), ("max_hr", "REAL"),
+                         ("weekly_km_json", "TEXT"), ("exported", "INTEGER"),
+                         ("weeks_meta_json", "TEXT")]:
+        _try_alter(f"ALTER TABLE predictions ADD COLUMN {col} {coltype}")
 
 
 init_db()
@@ -219,14 +285,15 @@ def save_prediction(source, gender, predicted_seconds, user_id, inp, meta=None):
            (created_at, user_id, source, gender, predicted_seconds, actual_pr_seconds,
             typical_pace, avg_weekly_km, active_weeks, longest_km, easy_hr, max_hr,
             weekly_km_json, weeks_meta_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           RETURNING id""",
         (datetime.now(timezone.utc).isoformat(), user_id, source, gender, predicted_seconds, None,
          inp["typical_pace"], inp["avg_weekly_km"], inp["active_weeks"],
          inp["longest_km"], inp["easy_hr"], inp["max_hr"],
          json.dumps(inp["weekly_km"]), json.dumps(meta)),
     )
+    rid = cur.fetchone()["id"]
     con.commit()
-    rid = cur.lastrowid
     con.close()
     return rid
 
@@ -298,11 +365,11 @@ def signup(data: Credentials):
         return {"error": "That username is taken."}
     salt, h = hash_pw(data.password)
     cur = con.execute(
-        "INSERT INTO users (username, salt, pw_hash, created_at) VALUES (?,?,?,?)",
+        "INSERT INTO users (username, salt, pw_hash, created_at) VALUES (?,?,?,?) RETURNING id",
         (data.username, salt, h, datetime.now(timezone.utc).isoformat()),
     )
+    uid = cur.fetchone()["id"]
     con.commit()
-    uid = cur.lastrowid
     con.close()
     return {"token": new_session(uid), "username": data.username}
 
@@ -667,9 +734,9 @@ def add_run(data: AddRun, user_id: int | None = Depends(get_user_id)):
         (user_id, run_date, year, week, round(data.dist_km, 2), round(pace_dec, 3), hr),
     )
     total = con.execute(
-        "SELECT SUM(dist_km) FROM runs WHERE user_id=? AND year=? AND week=?",
+        "SELECT COALESCE(SUM(dist_km), 0) AS total FROM runs WHERE user_id=? AND year=? AND week=?",
         (user_id, year, week),
-    ).fetchone()[0]
+    ).fetchone()["total"]
     # keep the chart bar in sync by finding this week's position in the prediction's meta
     prow = con.execute(
         "SELECT id, weekly_km_json, weeks_meta_json FROM predictions "
@@ -696,9 +763,9 @@ def add_run(data: AddRun, user_id: int | None = Depends(get_user_id)):
 def resync_week_total(con, user_id: int, year: int, week: int):
     """Keep the prediction's bar in sync with the sum of the runs in that week."""
     total = con.execute(
-        "SELECT COALESCE(SUM(dist_km), 0) FROM runs WHERE user_id=? AND year=? AND week=?",
+        "SELECT COALESCE(SUM(dist_km), 0) AS total FROM runs WHERE user_id=? AND year=? AND week=?",
         (user_id, year, week),
-    ).fetchone()[0]
+    ).fetchone()["total"]
     prow = con.execute(
         "SELECT id, weekly_km_json, weeks_meta_json FROM predictions "
         "WHERE user_id=? AND weekly_km_json IS NOT NULL ORDER BY id DESC LIMIT 1",

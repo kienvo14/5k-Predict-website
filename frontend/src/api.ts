@@ -1,5 +1,6 @@
-// Central place for talking to the backend + storing the login token.
+//Central place for talking to the backend + storing the login token.
 const API = "https://fivek-backend.onrender.com";
+//const API = "http://localhost:8000";
 
 export function getToken(): string | null {
   return localStorage.getItem("token");
@@ -9,7 +10,7 @@ export function setToken(t: string | null) {
   else localStorage.removeItem("token");
 }
 
-// Every request auto-attaches the token (if logged in).
+//Every request auto-attaches the token (if logged in).
 async function req(path: string, opts: RequestInit = {}) {
   const token = getToken();
   const headers: Record<string, string> = { ...(opts.headers as Record<string, string>) };
@@ -35,6 +36,8 @@ export const api = {
   claim: (id: number) => req("/claim", json({ id })),
   history: () => req("/history"),
   progress: () => req("/progress"),
-  addRun: (week_idx: number, dist_km: number, pace: string, date?: string, hr?: number) =>
-    req("/add-run", json({ week_idx, dist_km, pace, date, hr })),
+  addRun: (week_key: string, dist_km: number, pace: string, date?: string, hr?: number) =>
+    req("/add-run", json({ week_key, dist_km, pace, date, hr })),
+  editRun: (run_id: number, hr: number | null) => req(`/runs/${run_id}/edit`, json({ hr })),
+  deleteRun: (run_id: number) => req(`/runs/${run_id}`, { method: "DELETE" }),
 };

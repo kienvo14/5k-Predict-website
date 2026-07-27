@@ -349,9 +349,21 @@ input:focus, select:focus { outline: none; border-color: var(--line-2); }
 .wd-sub { color: var(--accent-2); font-size: 0.85rem; margin-top: 4px; }
 .wd-runs { margin-top: 16px; display: flex; flex-direction: column; gap: 2px; }
 .wd-run {
-  display: grid; grid-template-columns: 1.4fr 1fr 1.2fr 1fr; gap: 8px;
+  display: grid; grid-template-columns: 1.3fr 0.9fr 1.1fr 1.1fr 36px; gap: 8px;
+  align-items: center;
   padding: 9px 6px; font-size: 0.85rem; border-bottom: 1px solid var(--line);
 }
+.hr-cell { cursor: pointer; }
+.hr-cell:hover { color: var(--accent-2); }
+.hr-input {
+  padding: 4px 8px !important; font-size: 0.85rem !important; text-align: center;
+}
+.run-del {
+  background: transparent; border: 1px solid var(--line); color: var(--muted);
+  border-radius: 8px; width: 32px; height: 30px; cursor: pointer; font-size: 0.9rem;
+  transition: all 0.15s ease; padding: 0;
+}
+.run-del:hover { border-color: #d64545; color: #ff8080; }
 .wd-run.wd-hdr {
   color: var(--muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 1px;
   border-bottom: 1px solid var(--line-2);

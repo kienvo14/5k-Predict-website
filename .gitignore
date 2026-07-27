@@ -22,6 +22,12 @@ raw-data-kaggle.csv
 # sqlite database (created at runtime, holds user predictions)
 *.db
 
+# secrets — env files stay LOCAL, never in git
+.env
+.env.local
+*.env
+!.env.example
+
 # os
 .DS_Store
 Thumbs.db

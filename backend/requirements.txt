@@ -5,3 +5,5 @@ pandas
 numpy
 python-multipart
 openpyxl
+psycopg[binary]
+python-dotenv

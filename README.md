@@ -8,16 +8,14 @@ A full-stack web app that predicts a runner's current 5K time within **±80 seco
 
 ## Data & attribution
 
-This project's ML model is trained entirely on **public research datasets**. All credit for the underlying data belongs to their original authors:
-
+This project's ML model is trained entirely on **public research datasets**:
 - **FitRec / Endomondo dataset** — Jianmo Ni, Larry Muhlstein, Julian McAuley (UCSD).
   *"Modeling heart rate and activity data for personalized fitness recommendation."* **WWW 2019.**
   Dataset: [cseweb.ucsd.edu/~jmcauley/datasets/fitrec.html](https://cseweb.ucsd.edu/~jmcauley/datasets/fitrec.html)
-  License: **academic use only, non-commercial, no redistribution.**
 - **Kaggle "Running races from Strava" dataset** — Oleg Oaer.
   [kaggle.com/datasets/olegoaer/running-races-strava](https://www.kaggle.com/datasets/olegoaer/running-races-strava)
 
-Raw data files are **not** included in this repo (too large and licensed). Only the processed per-athlete feature set (`backend/features.csv`, 776 rows) — derived from these sources for training — is checked in.
+Raw data files are **not** included in this repo (too large and licensed). Only the processed per-athlete feature set (`backend/features.csv`, 776 rows) is checked in.
 
 ---
 
@@ -66,22 +64,6 @@ Open http://localhost:5173
 
 **Optional:** set `DATABASE_URL` in `backend/.env` to test against Postgres locally. Otherwise falls back to SQLite (`app.db`) automatically.
 
-## Repo layout
-```
-backend/            FastAPI app + ML model + DB layer
-  main.py           API endpoints, auth, DB abstraction (SQLite <-> Postgres)
-  features.csv      per-athlete training data
-  requirements.txt
-
-frontend/           React + TypeScript (Vite)
-  src/App.tsx           main UI, routing
-  src/ProgressPage.tsx  weekly chart + add/edit/delete runs
-  src/History.tsx       past predictions
-  src/Auth.tsx          login / signup modal
-  src/api.ts            backend calls + token handling
-  src/format.ts         pace formatting (MM:SS <-> decimal)
-```
-
 ## Honest caveats
-- **Labels are Riegel estimates** derived from training runs, not actual race times — so the model predicts *best-effort 5K potential* rather than certified race performance.
-- Verified PRs (from the feedback loop) are the only "ground truth" labels in the pipeline.
+- **Labels are Riegel estimates** derived from training runs, not actual race times. Therfore, it only predicts from the estimated performance not real PR race.
+- Verified PR from the user are the only time real correct PR can be used.

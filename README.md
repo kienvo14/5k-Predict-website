@@ -29,9 +29,9 @@ Raw data files are **not** included in this repo (too large and licensed). Only 
 ## Features
 - Predict from **manually typed** training data OR **uploaded Strava export** (.csv / .xlsx)
 - **Accounts** — sign up, log in, prediction history persists across sessions
-- **Progress chart** — Strava-style connected-line chart of weekly mileage (last 16 weeks); click any week to see its runs
+- **Progress chart** — Strava-style connected-line chart of last 16 weeks mileage
 - **Editable weeks** — add / edit / delete runs directly on the chart
-- **Feedback loop** — enter your real 5K PR to see how close the model was; verified PRs become new training data (retrains after 10 accumulate)
+- **Feedback loop** — enter your real 5K PR to see how close the model was. Verifed 5k data then used to retrain model after 10 data
 
 ## Results
 - **Cross-validated MAE:** 82 seconds (~1:22)

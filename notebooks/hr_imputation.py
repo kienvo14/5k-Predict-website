@@ -234,9 +234,11 @@ val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_worker
 class BiLstmHr(nn.Module):
     def __init__(self, in_dim=6, hidden=HIDDEN, layers=2, dropout=0.2):
         super().__init__()
+        # Fix B: unidirectional for forecast-the-future framing. The backward
+        # pass in a biLSTM would read through the zeroed HR gap and add noise.
         self.lstm = nn.LSTM(in_dim, hidden, num_layers=layers, batch_first=True,
-                            bidirectional=True, dropout=dropout)
-        self.head = nn.Linear(hidden * 2, 1)
+                            bidirectional=False, dropout=dropout)
+        self.head = nn.Linear(hidden, 1)
 
     def forward(self, x):
         h, _ = self.lstm(x)
@@ -255,6 +257,15 @@ print(model)
 def masked_mse(pred, target, mask):
     return ((pred - target) ** 2 * mask).sum() / mask.sum().clamp(min=1)
 
+# Fix A: reconstruct HR on the WHOLE sequence, not just the gap. Gap timesteps
+# get higher weight so we still optimize for the actual forecast task, but the
+# 270 observed steps contribute gradient too — forcing the LSTM to actually
+# learn the pace/alt -> HR mapping instead of collapsing to "extrapolate last HR".
+GAP_WEIGHT = 5.0
+def weighted_mse(pred, target, mask):
+    w = mask * GAP_WEIGHT + (1.0 - mask)
+    return ((pred - target) ** 2 * w).sum() / w.sum()
+
 hr_std = std[2]  # for converting normalized-RMSE back to bpm
 
 for epoch in range(1, EPOCHS + 1):
@@ -263,7 +274,7 @@ for epoch in range(1, EPOCHS + 1):
     for x, y, m in tqdm(train_dl, desc=f"epoch {epoch}"):
         x, y, m = x.to(device), y.to(device), m.to(device)
         pred = model(x)
-        loss = masked_mse(pred, y, m)
+        loss = weighted_mse(pred, y, m)
         opt.zero_grad(); loss.backward(); opt.step()
         train_loss += loss.item() * x.size(0)
     train_loss /= len(train_ds)

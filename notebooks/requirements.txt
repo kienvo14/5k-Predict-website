@@ -4,3 +4,10 @@ numpy
 pandas
 matplotlib
 tqdm
+
+# Extra deps for test_donut.py (pretrained OCR/document-model experiment). NOT used by the app backend.
+transformers
+Pillow
+sentencepiece
+protobuf
+pytesseract

@@ -14,8 +14,8 @@ from tqdm import tqdm
 
 SRC          = "../endomondoHR.json"       # your raw file
 DST          = "fitrec_diverse.json.gz"    # compact output
-MAX_PER_USER = 20                           # cap per user — more data, still diverse
-MIN_LEN      = 200                          # min samples to keep a run
+MAX_PER_USER = 200                          # loosened — most users have <20 runs anyway
+MIN_LEN      = 150                          # slightly shorter runs still useful
 
 # Only keep the fields we need for HR imputation — massive size reduction
 KEEP_FIELDS = ("userId", "sport", "heart_rate", "altitude",

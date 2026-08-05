@@ -43,14 +43,15 @@ print(f"torch {torch.__version__}, device={device}")
 
 # %%
 FITREC_PATH   = "fitrec_diverse.json.gz"  # compact preprocessed file (run preprocess_fitrec.py first)
-MAX_RUNS      = 15000                   # cap for THIS training run; the preprocessed file is already diverse
+MAX_RUNS      = 100000                  # cap for THIS training run; the preprocessed file is already diverse
 MAX_PER_USER  = 6                       # not enforced here anymore — done by preprocess_fitrec.py
 MIN_LEN       = 200                     # skip runs shorter than this many samples
 SEQ_LEN       = 300                     # crop / pad each run to this length
 GAP_LEN       = 30                      # simulate a ~5min HR gap (samples in the mask)
 BATCH_SIZE    = 64
-EPOCHS        = 6
-HIDDEN        = 128
+EPOCHS        = 15
+PATIENCE      = 3        # early stop after this many epochs without val improvement
+HIDDEN        = 192      # bumped for the ~25x larger dataset
 LR            = 1e-3
 VAL_FRACTION  = 0.15
 SEED          = 42
@@ -232,7 +233,7 @@ val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_worker
 
 # %%
 class BiLstmHr(nn.Module):
-    def __init__(self, in_dim=6, hidden=HIDDEN, layers=2, dropout=0.2):
+    def __init__(self, in_dim=6, hidden=HIDDEN, layers=2, dropout=0.3):
         super().__init__()
         # Fix B: unidirectional for forecast-the-future framing. The backward
         # pass in a biLSTM would read through the zeroed HR gap and add noise.
@@ -268,6 +269,11 @@ def weighted_mse(pred, target, mask):
 
 hr_std = std[2]  # for converting normalized-RMSE back to bpm
 
+best_val = float("inf")
+best_state = None
+best_epoch = 0
+stale = 0
+
 for epoch in range(1, EPOCHS + 1):
     model.train()
     train_loss = 0.0
@@ -289,7 +295,26 @@ for epoch in range(1, EPOCHS + 1):
             val_n   += m.sum().item()
     val_rmse_norm = (val_sse / max(val_n, 1)) ** 0.5
     val_rmse_bpm  = val_rmse_norm * hr_std
-    print(f"epoch {epoch}: train_loss={train_loss:.4f}  val_RMSE={val_rmse_bpm:.2f} bpm")
+
+    if val_rmse_bpm < best_val:
+        best_val = val_rmse_bpm
+        best_epoch = epoch
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        stale = 0
+        marker = "  *best"
+    else:
+        stale += 1
+        marker = ""
+    print(f"epoch {epoch}: train_loss={train_loss:.4f}  val_RMSE={val_rmse_bpm:.2f} bpm{marker}")
+
+    if stale >= PATIENCE:
+        print(f"early stop: no val improvement for {PATIENCE} epochs (best={best_val:.2f} bpm @ epoch {best_epoch})")
+        break
+
+# restore best weights for the baseline comparison + save below
+if best_state is not None:
+    model.load_state_dict(best_state)
+    print(f"restored best-epoch weights (epoch {best_epoch}, val_RMSE={best_val:.2f} bpm)")
 
 
 # %% [markdown]

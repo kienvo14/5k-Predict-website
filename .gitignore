@@ -16,8 +16,18 @@ frontend/dist/
 endomondoHR*.json
 *.npy
 *.gz
+*.parquet
 preprocess_data.csv
 raw-data-kaggle.csv
+
+# ML experiment artifacts (models + generated images — regenerate from scripts)
+*.pt
+*.pth
+*.onnx
+*.pkl
+notebooks/out/
+notebooks/models/
+notebooks/screenshots/
 
 # sqlite database (created at runtime, holds user predictions)
 *.db

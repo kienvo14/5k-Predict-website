@@ -1,0 +1,23 @@
+# Keep the image small and secrets out of it.
+# DATABASE_URL comes from Cloud Run / Secret Manager at runtime, not the image.
+*.env
+.env
+.env.*
+
+# Local SQLite dev databases — prod uses Postgres via DATABASE_URL
+*.db
+app.db
+predictions.db
+
+# Python cruft
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/

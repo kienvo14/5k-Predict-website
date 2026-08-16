@@ -1,6 +1,10 @@
 //Central place for talking to the backend + storing the login token.
-const API = "https://fivek-backend.onrender.com";
-//const API = "http://localhost:8000";
+// Backend base URL: set VITE_API_URL in the environment (Vercel) to override.
+// Falls back to the Cloud Run service if the env var isn't set.
+const API =
+  import.meta.env.VITE_API_URL ??
+  "https://fivek-predictor-1087423901733.us-central1.run.app";
+//local dev: VITE_API_URL=http://localhost:8000
 
 export function getToken(): string | null {
   return localStorage.getItem("token");

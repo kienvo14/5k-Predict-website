@@ -1,0 +1,13 @@
+# LOCAL-ONLY dependencies (the "Better model" / PyTorch path).
+# NOT installed on Cloud Run — the deployed image stays lean (no torch), and the
+# backend gracefully falls back to LinearRegression when torch isn't present.
+#
+# Install locally with the CPU-only wheel (small, no CUDA):
+#   pip install -r requirements.txt
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# (kept as a separate file so `requirements.txt` — what the Dockerfile uses —
+#  never pulls the ~1 GB torch download into the Cloud Run image.)
+
+-r requirements.txt
+torch

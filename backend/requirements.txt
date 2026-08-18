@@ -7,4 +7,3 @@ python-multipart
 openpyxl
 psycopg[binary]
 python-dotenv
-torch

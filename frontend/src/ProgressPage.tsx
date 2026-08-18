@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "./api";
-import { paceToStr } from "./format";
+import { paceToStr, paceToDec, paceMiToKm, miToKm, kmToMi, kmToMiStr, paceKmToMiStr } from "./format";
 
 type Run = { id: number; date: string; dist_km: number; pace: number | null; hr: number | null };
 type Week = {
@@ -36,8 +36,8 @@ function RunRow({ run, onChanged }: { run: Run; onChanged: () => void }) {
   return (
     <div className="wd-run">
       <span className="wd-date">{run.date}</span>
-      <span>{run.dist_km} km</span>
-      <span>{paceToStr(run.pace)}/km</span>
+      <span>{kmToMiStr(run.dist_km)} mi</span>
+      <span>{paceKmToMiStr(run.pace)}/mi</span>
       {editing ? (
         <input
           className="hr-input"
@@ -102,10 +102,11 @@ export default function ProgressPage({ loggedIn, refreshKey }: { loggedIn: boole
   const addRun = async () => {
     if (!selWeek) return;
     setRErr("");
+    // form is miles + min/mile; backend stores km + min/km
     const d = await api.addRun(
       selWeek.week_key,
-      parseFloat(rDist),
-      rPace,
+      miToKm(parseFloat(rDist)),
+      rPace.trim() ? paceToStr(paceMiToKm(paceToDec(rPace))) : rPace,
       rDate || undefined,
       rHr ? parseFloat(rHr) : undefined
     );
@@ -125,11 +126,13 @@ export default function ProgressPage({ loggedIn, refreshKey }: { loggedIn: boole
   const W = 720, H = 240, padL = 12, padR = 52, padT = 28, padB = 14;
   const cw = W - padL - padR;
   const ch = H - padT - padB;
-  const maxM = Math.max(...weeks.map((w) => w.mileage_km), 1);
-  const niceMax = Math.max(30, Math.ceil(maxM / 30) * 30);
+  // chart is drawn in miles
+  const mi = (w: Week) => kmToMi(w.mileage_km);
+  const maxM = Math.max(...weeks.map(mi), 1);
+  const niceMax = Math.max(20, Math.ceil(maxM / 10) * 10);
   const xAt = (i: number) => padL + (n <= 1 ? cw / 2 : (i / (n - 1)) * cw);
   const yAt = (m: number) => padT + ch - (m / niceMax) * ch;
-  const pts = weeks.map((w, i) => [xAt(i), yAt(w.mileage_km)] as const);
+  const pts = weeks.map((w, i) => [xAt(i), yAt(mi(w))] as const);
   const line = pts.map((p, i) => (i === 0 ? "M" : "L") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
   const area = `${line} L ${xAt(n - 1).toFixed(1)} ${(padT + ch).toFixed(1)} L ${xAt(0).toFixed(1)} ${(padT + ch).toFixed(1)} Z`;
   const grid = [0, niceMax / 2, niceMax];
@@ -142,7 +145,7 @@ export default function ProgressPage({ loggedIn, refreshKey }: { loggedIn: boole
         {grid.map((g, i) => (
           <g key={i}>
             <line x1={padL} x2={padL + cw} y1={yAt(g)} y2={yAt(g)} stroke="#242424" strokeWidth="1" />
-            <text x={padL + cw + 10} y={yAt(g) + 4} fill="#8a8a8a" fontSize="13">{g} km</text>
+            <text x={padL + cw + 10} y={yAt(g) + 4} fill="#8a8a8a" fontSize="13">{g} mi</text>
           </g>
         ))}
         <path d={area} fill="rgba(252,76,2,0.14)" />
@@ -150,8 +153,8 @@ export default function ProgressPage({ loggedIn, refreshKey }: { loggedIn: boole
         {selWeek && sel != null && (
           <>
             <line x1={xAt(sel)} x2={xAt(sel)} y1={padT} y2={padT + ch} stroke="#fff" strokeWidth="1.5" opacity="0.45" />
-            <text x={xAt(sel)} y={yAt(weeks[sel].mileage_km) - 13} fill="#fff" fontSize="14" fontWeight="700" textAnchor="middle">
-              {weeks[sel].mileage_km} km
+            <text x={xAt(sel)} y={yAt(mi(weeks[sel])) - 13} fill="#fff" fontSize="14" fontWeight="700" textAnchor="middle">
+              {kmToMiStr(weeks[sel].mileage_km)} mi
             </text>
           </>
         )}
@@ -165,9 +168,9 @@ export default function ProgressPage({ loggedIn, refreshKey }: { loggedIn: boole
 
       {selWeek && (
         <div className="week-detail">
-          <div className="wd-title">{selWeek.label} · {selWeek.mileage_km} km</div>
+          <div className="wd-title">{selWeek.label} · {kmToMiStr(selWeek.mileage_km)} mi</div>
           <div className="wd-sub">
-            {selWeek.num_runs} runs · {paceToStr(selWeek.avg_pace)}/km · {selWeek.avg_hr ?? "–"} bpm
+            {selWeek.num_runs} runs · {paceKmToMiStr(selWeek.avg_pace)}/mi · {selWeek.avg_hr ?? "–"} bpm
           </div>
 
           {selWeek.runs.length > 0 && (
@@ -187,8 +190,8 @@ export default function ProgressPage({ loggedIn, refreshKey }: { loggedIn: boole
           )}
           <div className="add-run">
             <input type="date" value={rDate} onChange={(e) => setRDate(e.target.value)} />
-            <input value={rDist} onChange={(e) => setRDist(e.target.value)} placeholder="distance km" />
-            <input value={rPace} onChange={(e) => setRPace(e.target.value)} placeholder="pace 5:30" />
+            <input value={rDist} onChange={(e) => setRDist(e.target.value)} placeholder="distance mi" />
+            <input value={rPace} onChange={(e) => setRPace(e.target.value)} placeholder="pace 8:50" />
             <input value={rHr} onChange={(e) => setRHr(e.target.value)} placeholder="HR" />
             <button onClick={addRun} type="button">Add run</button>
           </div>

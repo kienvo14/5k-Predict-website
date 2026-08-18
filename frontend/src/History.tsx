@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "./api";
-import { paceToStr } from "./format";
+import { paceKmToMiStr } from "./format";
 
 export type HistoryRow = {
   id: number;
@@ -59,7 +59,7 @@ export default function History({
         <button className="hrow" key={r.id} onClick={() => onSelect(r)} type="button">
           <div className="hleft">
             <div className="hdate">{r.date}</div>
-            <div className="hsrc">{r.source} · {r.active_weeks} wks · {paceToStr(r.typical_pace)}/km</div>
+            <div className="hsrc">{r.source} · {r.active_weeks} wks · {paceKmToMiStr(r.typical_pace)}/mi</div>
           </div>
           <div className="hmid">
             <div className="hlabel">predicted</div>

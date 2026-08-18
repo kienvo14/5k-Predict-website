@@ -4,7 +4,7 @@ import { api, getToken, setToken } from "./api";
 import Auth from "./Auth";
 import History, { HistoryRow } from "./History";
 import ProgressPage from "./ProgressPage";
-import { paceToStr, paceToDec } from "./format";
+import { paceToStr, paceToDec, kmToMi, miToKm, paceKmToMi, paceMiToKm, paceKmToMiStr, kmToMiStr } from "./format";
 
 type Prediction = {
   id?: number;
@@ -51,11 +51,13 @@ export default function App() {
       const row = d.history[0];
       setMode("manual");
       setGender(row.gender ?? "male");
-      setPace(row.typical_pace != null ? paceToStr(row.typical_pace) : "");
+      // stored values are metric (min/km, km) -> show in the form as min/mile, miles
+      setPace(row.typical_pace != null ? paceToStr(paceKmToMi(row.typical_pace)) : "");
       setEasyHr(row.easy_hr != null ? String(row.easy_hr) : "");
       setMaxHr(row.max_hr != null ? String(row.max_hr) : "");
-      setLongest(row.longest_km != null ? String(row.longest_km) : "");
-      if (row.weekly_km && row.weekly_km.length) setWeeks(row.weekly_km.map(String));
+      setLongest(row.longest_km != null ? kmToMi(row.longest_km).toFixed(1) : "");
+      if (row.weekly_km && row.weekly_km.length)
+        setWeeks(row.weekly_km.map((km: number) => kmToMi(km).toFixed(1)));
     }
   };
 
@@ -105,13 +107,17 @@ export default function App() {
 
   const submitManual = async () => {
     resetResult();
+    // UI is in miles + min/mile; convert to the km + min/km the model expects.
     const data = await api.predict({
       gender,
-      typical_pace: paceToDec(pace),
+      typical_pace: paceMiToKm(paceToDec(pace)),
       easy_hr: parseFloat(easyHr),
       max_hr: parseFloat(maxHr),
-      longest_run_km: parseFloat(longest),
-      weekly_mileage_km: weeks.map((w) => parseFloat(w)).filter((w) => !isNaN(w) && w > 0),
+      longest_run_km: miToKm(parseFloat(longest)),
+      weekly_mileage_km: weeks
+        .map((w) => parseFloat(w))
+        .filter((w) => !isNaN(w) && w > 0)
+        .map((mi) => miToKm(mi)),
     });
     setLoading(false);
     data.error ? setError(data.error) : (setResult(data), setRefreshKey((k) => k + 1));
@@ -144,11 +150,12 @@ export default function App() {
   const loadPrediction = (row: HistoryRow) => {
     setMode("manual");
     setGender(row.gender ?? "male");
-    setPace(row.typical_pace != null ? paceToStr(row.typical_pace) : "");
+    // stored metric -> shown as min/mile, miles
+    setPace(row.typical_pace != null ? paceToStr(paceKmToMi(row.typical_pace)) : "");
     setEasyHr(row.easy_hr != null ? String(row.easy_hr) : "");
     setMaxHr(row.max_hr != null ? String(row.max_hr) : "");
-    setLongest(row.longest_km != null ? String(row.longest_km) : "");
-    setWeeks([...(row.weekly_km ?? []).map(String), ""]);
+    setLongest(row.longest_km != null ? kmToMi(row.longest_km).toFixed(1) : "");
+    setWeeks([...(row.weekly_km ?? []).map((km) => kmToMi(km).toFixed(1)), ""]);
     setResult(null);
     setError("");
     setFeedback(null);
@@ -181,8 +188,8 @@ export default function App() {
                   </select>
                 </div>
                 <div className="field">
-                  <label>Typical pace (mm:ss / km)</label>
-                  <input value={pace} onChange={(e) => setPace(e.target.value)} placeholder="5:30" />
+                  <label>Typical pace (mm:ss / mile)</label>
+                  <input value={pace} onChange={(e) => setPace(e.target.value)} placeholder="8:50" />
                 </div>
                 <div className="field">
                   <label>Easy-run avg HR</label>
@@ -193,19 +200,19 @@ export default function App() {
                   <input value={maxHr} onChange={(e) => setMaxHr(e.target.value)} placeholder="185" />
                 </div>
                 <div className="field wide">
-                  <label>Longest recent run (km)</label>
-                  <input value={longest} onChange={(e) => setLongest(e.target.value)} placeholder="15" />
+                  <label>Longest recent run (miles)</label>
+                  <input value={longest} onChange={(e) => setLongest(e.target.value)} placeholder="9" />
                 </div>
               </div>
             </div>
 
             <div className="col">
-              <label className="section-label">Weekly mileage (km per week)</label>
+              <label className="section-label">Weekly mileage (miles per week)</label>
               <div className="weeks">
                 {weeks.map((w, i) => (
                   <div className="week-row" key={i}>
                     <span className="week-num">Week {i + 1}</span>
-                    <input value={w} onChange={(e) => setWeek(i, e.target.value)} placeholder="40" />
+                    <input value={w} onChange={(e) => setWeek(i, e.target.value)} placeholder="25" />
                     {weeks.length > 1 && (
                       <button className="rm" onClick={() => setWeeks(weeks.filter((_, j) => j !== i))} type="button">×</button>
                     )}
@@ -255,8 +262,8 @@ export default function App() {
           <div className="range">likely {result.range_low} – {result.range_high}</div>
           {result.detected && (
             <div className="detected">
-              From {result.detected.runs_used} runs · typical pace {paceToStr(result.detected.typical_pace)}/km ·
-              avg HR {result.detected.avg_hr} · longest {result.detected.longest_km} km
+              From {result.detected.runs_used} runs · typical pace {paceKmToMiStr(result.detected.typical_pace)}/mi ·
+              avg HR {result.detected.avg_hr} · longest {kmToMiStr(result.detected.longest_km)} mi
             </div>
           )}
           <div className="note">{result.note}</div>
@@ -314,7 +321,7 @@ export default function App() {
             <circle cx="50" cy="12" r="5.5" fill="#fc4c02" />
           </svg>
         </div>
-        <div className="badge">TRAINED ON 117,000+ RUNS</div>
+        <div className="badge">TRAINED ON 104,000+ RUNS</div>
         <h1>How fast is your 5K right now?</h1>
         <p>A regression model estimates your current 5K from your training — pace, mileage, and heart rate.</p>
       </header>
@@ -346,13 +353,13 @@ export default function App() {
       </Routes>
 
       <div className="stats">
-        <div className="stat"><b>117,000+</b><span>runs</span></div>
-        <div className="stat"><b>734,000</b><span>miles</span></div>
-        <div className="stat"><b>±80s</b><span>accuracy</span></div>
-        <div className="stat"><b>SQLite</b><span>storage</span></div>
+        <div className="stat"><b>104,000+</b><span>clean runs</span></div>
+        <div className="stat"><b>700,000</b><span>miles</span></div>
+        <div className="stat"><b>±66s</b><span>accuracy</span></div>
+        <div className="stat"><b>PostgreSQL</b><span>storage</span></div>
       </div>
 
-      <footer className="foot">React + TypeScript · FastAPI · scikit-learn · SQLite — CV MAE ≈ 82s</footer>
+      <footer className="foot">React + TypeScript · FastAPI · PyTorch · PostgreSQL · GCP — CV MAE ≈ 66s</footer>
 
       {showAuth && <Auth onClose={() => setShowAuth(false)} onAuthed={onAuthed} />}
     </div>

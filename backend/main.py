@@ -40,6 +40,7 @@ from pydantic import BaseModel
 from sklearn.linear_model import LinearRegression
 import pandas as pd
 import numpy as np
+import pytorch_model  # safe to import — it does NOT load torch until a request needs it
 
 FEATURE_COLS = ["longest_run", "max_hr", "easy_pace", "easy_hr", "aerobic",
                 "avg_weekly_distance_m", "active_weeks", "consistency_std", "gender"]
@@ -48,6 +49,7 @@ CSV_COLS = ["userId", "longest_run", "gender", "max_hr", "easy_pace", "easy_hr",
             "aerobic", "avg_weekly_distance_m", "active_weeks", "consistency_std",
             "fastest_5k", "fastest_5k_str"]
 CV_MAE = 82
+PYTORCH_MAE = 76  # held-out MAE of the PyTorch HistoryModel (models/pytorch/metadata.json)
 DB_PATH = "app.db"
 FEATURES_PATH = "features.csv"
 MIN_NEW_TO_RETRAIN = 10   # append real-PR rows to features.csv once this many accumulate
@@ -355,6 +357,15 @@ def root():
     return {"status": "ok", "message": "5K Predictor API is running"}
 
 
+@app.get("/models")
+def models_info():
+    """Model-comparison card: real held-out MAE for each model + whether torch is available here."""
+    with open("model_cards.json") as f:
+        cards = json.load(f)
+    cards["pytorch_available"] = pytorch_model.is_installed()
+    return cards
+
+
 @app.post("/signup")
 def signup(data: Credentials):
     if len(data.username) < 3 or len(data.password) < 4:
@@ -427,6 +438,7 @@ def find_col(df: pd.DataFrame, *candidates: str):
 
 @app.post("/predict-from-file")
 async def predict_from_file(gender: str = Form(...), file: UploadFile = File(...),
+                            model: str = Form("linear"),
                             user_id: int | None = Depends(get_user_id)):
     try:
         raw = await file.read()
@@ -494,7 +506,33 @@ async def predict_from_file(gender: str = Form(...), file: UploadFile = File(...
     longest = float(recent["dist_km"].max())
 
     result = core_predict(gender, typical_pace, easy_hr, max_hr, longest, weekly)
+
+    # Optional: re-price with the PyTorch model. torch is imported ONLY here, on
+    # demand — the default 'linear' path above never loads it.
+    if model == "pytorch" and "error" not in result:
+        if not pytorch_model.is_installed():
+            result["model_note"] = ("PyTorch model unavailable in this environment — "
+                                    "showing the LinearRegression estimate.")
+            result["model"] = "linear"
+        else:
+            mh = pd.to_numeric(recent[mhr_col], errors="coerce") if mhr_col else None
+            run_rows = []
+            for i, (_, r) in enumerate(recent.iterrows()):
+                a_hr = float(r["hr"]) if pd.notna(r["hr"]) else None
+                m_hr = float(mh.iloc[i]) if (mh is not None and pd.notna(mh.iloc[i])) else a_hr
+                run_rows.append(pytorch_model.run_features(
+                    float(r["dist_km"]), float(r["dur_min"]) * 60.0, a_hr, m_hr))
+            pred = pytorch_model.predict(run_rows)
+            result["predicted_seconds"] = round(pred, 1)
+            result["predicted_time"] = fmt(pred)
+            result["range_low"] = fmt(pred - PYTORCH_MAE)
+            result["range_high"] = fmt(pred + PYTORCH_MAE)
+            result["model"] = "pytorch"
+            result["note"] = (f"PyTorch HistoryModel over your {len(recent)} runs, "
+                              f"+/- ~{PYTORCH_MAE}s (held-out MAE).")
+
     if "error" not in result:
+        result.setdefault("model", "linear")
         result["detected"] = {
             "runs_used": len(recent),
             "typical_pace": round(typical_pace, 2),

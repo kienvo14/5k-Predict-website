@@ -4,6 +4,7 @@ import { api, getToken, setToken } from "./api";
 import Auth from "./Auth";
 import History, { HistoryRow } from "./History";
 import ProgressPage from "./ProgressPage";
+import Models from "./Models";
 import { paceToStr, paceToDec, kmToMi, miToKm, paceKmToMi, paceMiToKm, paceKmToMiStr, kmToMiStr } from "./format";
 
 type Prediction = {
@@ -12,6 +13,8 @@ type Prediction = {
   range_low: string;
   range_high: string;
   note: string;
+  model?: string;
+  model_note?: string;
   detected?: { runs_used: number; typical_pace: number; avg_hr: number; longest_km: number };
 };
 type FeedbackResult = { predicted_time: string; actual_time: string; diff_seconds: number; verdict: string };
@@ -35,6 +38,7 @@ export default function App() {
   const [weeks, setWeeks] = useState<string[]>(["", "", ""]);
   const [uploadGender, setUploadGender] = useState("male");
   const [file, setFile] = useState<File | null>(null);
+  const [uploadModel, setUploadModel] = useState<"linear" | "pytorch">("linear");
 
   // results
   const [result, setResult] = useState<Prediction | null>(null);
@@ -129,6 +133,7 @@ export default function App() {
     const form = new FormData();
     form.append("gender", uploadGender);
     form.append("file", file);
+    form.append("model", uploadModel);
     const data = await api.predictFile(form);
     setLoading(false);
     data.error ? setError(data.error) : (setResult(data), setRefreshKey((k) => k + 1));
@@ -247,6 +252,32 @@ export default function App() {
             <input type="file" accept=".csv,.xlsx,.xls" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
             <span>{file ? `📄 ${file.name}` : "Click to choose your activities file"}</span>
           </label>
+
+          <label className="section-label">Model</label>
+          <div className="modelpick">
+            <button
+              type="button"
+              className={uploadModel === "linear" ? "mp on" : "mp"}
+              onClick={() => setUploadModel("linear")}
+            >
+              <b>Fast</b><span>LinearRegression · instant</span>
+            </button>
+            <button
+              type="button"
+              className={uploadModel === "pytorch" ? "mp on" : "mp"}
+              onClick={() => setUploadModel("pytorch")}
+            >
+              <b>Better</b><span>PyTorch · lower error</span>
+            </button>
+          </div>
+          {uploadModel === "pytorch" && (
+            <div className="coldstart">
+              ⏳ The PyTorch model loads <code>torch</code> on first use, so the very first
+              prediction can take ~10–20s (cold start). It's more accurate but runs on your
+              per-run data — later requests are fast.
+            </div>
+          )}
+
           <button className="predict" onClick={submitUpload} disabled={loading}>
             {loading ? "Analyzing…" : "Predict from my Strava data"}
           </button>
@@ -257,9 +288,17 @@ export default function App() {
 
       {result && (
         <div className="result">
-          <div className="result-label">Estimated 5K</div>
+          <div className="result-label">
+            Estimated 5K
+            {result.model && (
+              <span className={"modelbadge " + result.model}>
+                {result.model === "pytorch" ? "PyTorch" : "LinearRegression"}
+              </span>
+            )}
+          </div>
           <div className="big">{result.predicted_time}</div>
           <div className="range">likely {result.range_low} – {result.range_high}</div>
+          {result.model_note && <div className="note warn">{result.model_note}</div>}
           {result.detected && (
             <div className="detected">
               From {result.detected.runs_used} runs · typical pace {paceKmToMiStr(result.detected.typical_pace)}/mi ·
@@ -330,6 +369,7 @@ export default function App() {
         <NavLink to="/" end className={navClass}>Predict</NavLink>
         <NavLink to="/history" className={navClass}>History</NavLink>
         <NavLink to="/progress" className={navClass}>Progress</NavLink>
+        <NavLink to="/models" className={navClass}>Models</NavLink>
       </div>
 
       <Routes>
@@ -350,6 +390,7 @@ export default function App() {
             </div>
           }
         />
+        <Route path="/models" element={<div className="card"><Models /></div>} />
       </Routes>
 
       <div className="stats">

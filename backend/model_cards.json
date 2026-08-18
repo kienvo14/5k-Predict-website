@@ -1,0 +1,41 @@
+{
+  "note": "Held-out MAE in seconds (lower = better). The research models were trained on the same 540-train / 134-validation athlete split, using a sequence of per-run summary features. The deployed model is a separate LinearRegression on 9 hand-crafted athlete-level aggregates — the features the website can actually collect from a user.",
+  "models": [
+    {
+      "key": "linear",
+      "name": "LinearRegression",
+      "family": "scikit-learn",
+      "deployed": true,
+      "mae_seconds": 82.1,
+      "input": "9 hand-crafted athlete aggregates (pace, weekly mileage, longest run, HR, gender)",
+      "blurb": "The live model. Instant, no heavy dependencies — serves every prediction by default."
+    },
+    {
+      "key": "pytorch",
+      "name": "HistoryModel (PyTorch)",
+      "family": "PyTorch",
+      "deployed": false,
+      "mae_seconds": 76.3,
+      "input": "sequence of up to 30 per-run summary vectors (10 features each)",
+      "blurb": "Per-run MLP encoder -> masked mean-pool -> MLP head. Best held-out accuracy. Loaded on demand (torch is imported only when you pick this model), so the first request is slow (cold start)."
+    },
+    {
+      "key": "gboost",
+      "name": "GradientBoosting",
+      "family": "scikit-learn",
+      "deployed": false,
+      "mae_seconds": 102.0,
+      "input": "per-athlete mean of the 10 per-run features",
+      "blurb": "Tree ensemble on run-mean features. Overfit the small athlete count here."
+    },
+    {
+      "key": "ridge",
+      "name": "Ridge",
+      "family": "scikit-learn",
+      "deployed": false,
+      "mae_seconds": 86.7,
+      "input": "per-athlete mean of the 10 per-run features",
+      "blurb": "Linear baseline on run-mean features."
+    }
+  ]
+}

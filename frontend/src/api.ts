@@ -34,6 +34,7 @@ export const api = {
   login: (username: string, password: string) => req("/login", json({ username, password })),
   logout: () => req("/logout", { method: "POST" }),
   me: () => req("/me"),
+  models: () => req("/models"),
   predict: (body: unknown) => req("/predict", json(body)),
   predictFile: (form: FormData) => req("/predict-from-file", { method: "POST", body: form }),
   feedback: (id: number, pr_time: string) => req("/feedback", json({ id, pr_time })),
